@@ -4,3 +4,4 @@ shopify_inventory_map_*.csv
 update_report_*.csv
 .env
 .history
+*.json

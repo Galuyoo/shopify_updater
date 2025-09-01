@@ -18,9 +18,10 @@ with st.sidebar:
     location_name = st.text_input("Location name (optional)", "")
     batch_size = st.number_input("Batch size", min_value=1, max_value=250, value=BATCH_SIZE_DEFAULT, step=1)
     dry_run = st.checkbox("Dry run", value=True)
-    build_map = st.checkbox("Build/refresh mapping before run", value=True)
+    build_map = st.checkbox("Build/refresh mapping before run", value=False)
     map_csv_override = st.text_input("Mapping CSV override (optional)", "")
     stock_csv_override = st.text_input("Stock CSV override (optional)", "")
+    force_refresh = st.checkbox("🔄 Force refresh Google Sheets (re-download all CSVs)", value=True)
     stock_csv_upload = st.file_uploader("Upload Stock CSV", type=["csv"])
 
 run_btn = st.button("Run update", type="primary")
@@ -56,8 +57,10 @@ if run_btn:
                 dry_run=dry_run,
                 build_map=build_map,
                 store_profiles=STORE_PROFILES,
-                progress=push
+                progress=push,
+                force_refresh_google_sheets=force_refresh,  # 👈 PASS THIS
             )
+
         except FileNotFoundError as e:
             st.error(str(e))
             st.stop()

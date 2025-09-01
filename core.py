@@ -1,7 +1,8 @@
 import os, time, json, re
 from typing import List, Dict, Optional, Callable, Tuple
 from datetime import datetime, timedelta
-
+import streamlit as st
+from utils.merge_google_sheets_for_stores import run as refresh_csvs
 import pandas as pd
 import requests
 
@@ -139,6 +140,75 @@ def translate_sku(messy_sku: str) -> Optional[str]:
         return f"{base}{colour}{size}"
     return None
 
+# --------------------------- Latest Helpers ---------------------------
+import glob
+
+def _store_from_map_csv(map_csv_path: str) -> Optional[str]:
+    """
+    utils/shopify_inventory_map_spoofy.csv -> spoofy
+    """
+    m = re.search(r"shopify_inventory_map_([a-z0-9_-]+)\.csv$", map_csv_path, re.I)
+    return m.group(1) if m else None
+
+def _latest_split_csv_for_store(store: str, base_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Find utils/shopify_inventory_map_<store>_<N>.csv with the highest N.
+    If none exist, return path for _1 (so we can create it).
+    """
+    base = base_dir or os.path.dirname(os.path.abspath(__file__))
+    # Usually your files are under utils/, so anchor there if present
+    utils_dir = os.path.join(base, "utils")
+    search_dir = utils_dir if os.path.isdir(utils_dir) else base
+
+    pattern = os.path.join(search_dir, f"shopify_inventory_map_{store}_*.csv")
+    candidates = []
+    for p in glob.glob(pattern):
+        m = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(p), re.I)
+        if m:
+            candidates.append((int(m.group(1)), p))
+
+    if not candidates:
+        # default to _1 in the utils/ folder (or base if utils missing)
+        return os.path.join(search_dir, f"shopify_inventory_map_{store}_1.csv")
+
+    candidates.sort(key=lambda t: t[0])
+    return candidates[-1][1]
+
+def _append_rows_csv(rows: list[dict], columns: list[str], csv_path: str, store: Optional[str] = None) -> str:
+    """
+    Append rows to csv_path, creating the file with headers if missing.
+    Automatically rotates to new file if >90MB.
+    Returns the path used (in case it rotated).
+    """
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    df = pd.DataFrame(rows, columns=columns)
+
+    # Auto-rotate logic if store is provided
+    if store:
+        current_path = csv_path
+        version = 1
+        match = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(csv_path))
+        if match:
+            version = int(match.group(1))
+        while os.path.exists(current_path) and _file_size_mb(current_path) >= 90:
+            version += 1
+            current_path = os.path.join(os.path.dirname(csv_path), f"shopify_inventory_map_{store}_{version}.csv")
+        csv_path = current_path
+
+    if not os.path.exists(csv_path):
+        df.to_csv(csv_path, index=False)
+    else:
+        df.to_csv(csv_path, mode="a", header=False, index=False)
+
+    return csv_path
+
+
+def _file_size_mb(path: str) -> float:
+    try:
+        return os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        return 0.0
+
 
 # ---- Throttling helpers ----
 def _throttle_wait_from_cost(data, default_wait=2.0):
@@ -233,7 +303,10 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
     """
     Ensure mapping CSV exists; if missing, build full (no date filter).
     If exists, append only NEW variants (by variant_id) using early stop and optional days_back filter.
-    Returns (total_variants_after, newly_added_count).
+
+    NEW: also append the same new rows to the latest split CSV file for this store:
+         utils/shopify_inventory_map_<store>_<N>.csv
+         and warn if that file passes 90/95/100 MB.
     """
     cols = ["product_id", "variant_id", "sku", "inventory_item_id"]
 
@@ -241,18 +314,39 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
     if folder:
         os.makedirs(folder, exist_ok=True)
 
-    # Full build (ignore days_back)
+    store = _store_from_map_csv(map_csv_path)
+    latest_split_csv = _latest_split_csv_for_store(store) if store else None
+
+    # ---------- Full build ----------
     if not os.path.exists(map_csv_path):
         log(f"🆕 Mapping not found. Building full mapping → {map_csv_path}", progress)
         rows = _fetch_products_variants(
             endpoint, headers, product_types, progress,
-            known_variant_ids=None, days_back=None  # ✅ No date filter
+            known_variant_ids=None, days_back=None  # full build ignores date filter
         )
+        # Write merged map
         pd.DataFrame(rows, columns=cols).to_csv(map_csv_path, index=False)
+
+        # Mirror to latest split (create if needed)
+        if latest_split_csv:
+            _append_rows_csv(rows, cols, latest_split_csv)
+
+        # Size checks (split file only _ this is the one you watch)
+        if latest_split_csv:
+            used_path = _append_rows_csv(rows, cols, latest_split_csv, store=store)
+            sz = _file_size_mb(used_path)
+            if sz >= 90:
+                log(f"[HARD] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
+            elif sz >= 80:
+                log(f"[ALERT] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
+            elif sz >= 60:
+                log(f"[WARN] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
+
+
         log(f"✅ Mapping created with {len(rows)} variants.", progress)
         return len(rows), len(rows)
 
-    # Incremental build (use days_back if given)
+    # ---------- Incremental append ----------
     existing = pd.read_csv(map_csv_path, dtype=str)
     known_ids = set(existing["variant_id"].astype(str)) if not existing.empty else set()
     log(f"🔎 Checking for new variants (current count: {len(known_ids)})…", progress)
@@ -263,13 +357,28 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
     )
 
     if new_rows:
-        pd.DataFrame(new_rows, columns=cols).to_csv(map_csv_path, mode="a", header=False, index=False)
+        # Append to merged map
+        _append_rows_csv(new_rows, cols, map_csv_path)
         log(f"➕ Added {len(new_rows)} new variants to mapping.", progress)
+
+        # Append to latest split
+        if latest_split_csv:
+            _append_rows_csv(new_rows, cols, latest_split_csv)
+            # Size checks after append
+            sz = _file_size_mb(latest_split_csv)
+            if sz >= 90:
+                log(f"[HARD] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
+            elif sz >= 80:
+                log(f"[ALERT] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
+            elif sz >= 60:
+                log(f"[WARN] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
     else:
         log("✅ No new variants found.", progress)
 
     total_after = len(known_ids) + len(new_rows)
     return total_after, len(new_rows)
+
+
 
 # ---------------------------
 # Other helpers
@@ -351,7 +460,9 @@ def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional
                stock_csv_path: Optional[str], dry_run: bool, build_map: bool,
                store_profiles: Dict[str, Dict],
                progress: Optional[Callable[[str], None]] = None,
-               days_back: int = 7) -> Tuple[pd.DataFrame, Dict]:
+               days_back: int = 7,
+               force_refresh_google_sheets: bool = False) -> Tuple[pd.DataFrame, Dict]:
+
     start_ts = time.time()
     profile = store_profiles[store]
     shop_url = profile["SHOP_URL"]
@@ -379,6 +490,10 @@ def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional
                 "• Remove spaces/newlines from the token"
             )
         raise
+
+    # 🔄 Refresh Google Sheet data (export + merge)
+    refresh_csvs(force_refresh=force_refresh_google_sheets, progress=progress)
+
 
     if build_map or not os.path.exists(map_csv):
         total_after, added = ensure_mapping(graphql_endpoint, headers, map_csv, product_types, progress, days_back=days_back)
