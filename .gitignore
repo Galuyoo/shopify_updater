@@ -1,5 +1,4 @@
 store_profiles.py
-constants.py
 shopify_inventory_map_*.csv
 update_report_*.csv
 .env
