@@ -5,6 +5,9 @@ import streamlit as st
 from utils.merge_google_sheets_for_stores import run as refresh_csvs
 import pandas as pd
 import requests
+from utils.sheet_config import SHEET_SOURCES
+from utils.gsheets_manager import get_services, get_credentials
+from utils.merge_google_sheets_for_stores import SIZE_WARN_MB, SIZE_ALERT_MB, SIZE_HARD_MB
 
 from constants import (
     API_VERSION, BATCH_SIZE_DEFAULT, SLEEP_BETWEEN_CALLS, RETRY_429_MAX,
@@ -16,9 +19,22 @@ from constants import (
 # ---------------------------
 
 def log(msg: str, cb: Optional[Callable[[str], None]] = None):
-    print(msg)
     if cb:
-        cb(msg)
+        try:
+            cb(msg)
+            return
+        except Exception:
+            pass
+    try:
+        print(msg)
+    except Exception:
+        # last-resort fallback if stdout was messed with
+        import sys
+        try:
+            (sys.__stdout__ or sys.stdout).write(str(msg) + "\n")
+        except Exception:
+            pass
+
 
 def _fetch_products_variants(
     endpoint: str,
@@ -174,33 +190,197 @@ def _latest_split_csv_for_store(store: str, base_dir: Optional[str] = None) -> O
     candidates.sort(key=lambda t: t[0])
     return candidates[-1][1]
 
-def _append_rows_csv(rows: list[dict], columns: list[str], csv_path: str, store: Optional[str] = None) -> str:
+# ===== Rotation + Registry helpers =====
+def _sheet_sources_json_path() -> str:
     """
-    Append rows to csv_path, creating the file with headers if missing.
-    Automatically rotates to new file if >90MB.
-    Returns the path used (in case it rotated).
+    Locate utils/sheet_config.py then resolve sheet_sources.json next to it.
+    This matches your new JSON-based registry.
     """
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    df = pd.DataFrame(rows, columns=columns)
+    import utils.sheet_config as sc
+    cfg_dir = os.path.dirname(sc.__file__)
+    return os.path.join(cfg_dir, "sheet_sources.json")
 
-    # Auto-rotate logic if store is provided
-    if store:
-        current_path = csv_path
-        version = 1
-        match = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(csv_path))
-        if match:
-            version = int(match.group(1))
-        while os.path.exists(current_path) and _file_size_mb(current_path) >= 90:
-            version += 1
-            current_path = os.path.join(os.path.dirname(csv_path), f"shopify_inventory_map_{store}_{version}.csv")
-        csv_path = current_path
+def _persist_new_sheet_id(store: str, new_sheet_id: str):
+    """
+    Append the new sheet ID to sheet_sources.json and update in-memory SHEET_SOURCES.
+    """
+    json_path = _sheet_sources_json_path()
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
 
-    if not os.path.exists(csv_path):
-        df.to_csv(csv_path, index=False)
+    data.setdefault(store, [])
+    if new_sheet_id not in data[store]:
+        data[store].append(new_sheet_id)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    # keep in-memory constant in sync for this process
+    if store not in SHEET_SOURCES:
+        SHEET_SOURCES[store] = []
+    if new_sheet_id not in SHEET_SOURCES[store]:
+        SHEET_SOURCES[store].append(new_sheet_id)
+
+def _current_version_for_store(store: str) -> int:
+    """
+    Version is 1-based. Current/last version = len(SHEET_SOURCES[store]).
+    If none exist, treat as version 0 for math (next will be 1).
+    """
+    return len(SHEET_SOURCES.get(store, []))
+
+def _tab_title(store: str, version: int, with_csv_suffix: bool = True) -> str:
+    base = f"shopify_inventory_map_{store}_{version}"
+    return f"{base}.csv" if with_csv_suffix else base
+
+def _resolve_or_create_tab_title(sheets, spreadsheet_id: str, desired_base_title: str, columns_count: int = 4) -> str:
+    """
+    Return matching tab (either 'base' or 'base.csv'). If none, create 'base.csv'.
+    """
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    titles = [s['properties']['title'] for s in meta.get('sheets', [])]
+
+    if desired_base_title in titles:
+        return desired_base_title
+
+    csv_title = f"{desired_base_title}.csv"
+    if csv_title in titles:
+        return csv_title
+
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {
+            "title": csv_title,
+            "gridProperties": {"rowCount": 1000, "columnCount": columns_count}
+        }}}]}
+    ).execute()
+    return csv_title
+
+def _create_new_spreadsheet_with_tab(sheets, store: str, version: int) -> tuple[str, str]:
+    """
+    Create spreadsheet named 'shopify_inventory_map_<store>_<version>'
+    and ensure a tab 'shopify_inventory_map_<store>_<version>.csv' exists.
+    Returns (spreadsheet_id, tab_title).
+    """
+    title = f"shopify_inventory_map_{store}_{version}"
+    new_ss = sheets.spreadsheets().create(body={"properties": {"title": title}}).execute()
+    ss_id = new_ss.get("spreadsheetId")
+    tab_title = _resolve_or_create_tab_title(sheets, ss_id, desired_base_title=title, columns_count=4)
+    return ss_id, tab_title
+
+def _rotate_google_targets_if_needed(
+    store: str,
+    current_split_csv_path: str,
+    size_threshold_mb: float = 90.0,
+) -> tuple[str, str]:
+    """
+    Decide which Google Sheet FILE (and tab) to append to.
+
+    If the *local* split CSV size is below threshold:
+      → keep appending to the latest registered spreadsheet (vN) and ensure its tab exists.
+
+    If the *local* split CSV size is >= threshold:
+      → create a brand-new Google Sheets FILE (vN+1),
+         ensure its tab exists, persist its ID to sheet_sources.json,
+         and return that new (sheet_id, tab_title) so new rows go there.
+    """
+    size_mb = _file_size_mb(current_split_csv_path)
+    if store not in SHEET_SOURCES or len(SHEET_SOURCES[store]) == 0:
+        raise RuntimeError(f"No spreadsheet IDs registered for store '{store}'")
+
+    current_version = _current_version_for_store(store)  # vN
+    latest_sheet_id = SHEET_SOURCES[store][-1]
+    _, sheets = get_services()
+
+    # Keep writing to current latest file
+    if size_mb < size_threshold_mb:
+        desired_base_title = _tab_title(store, current_version, with_csv_suffix=False)
+        target_tab = _resolve_or_create_tab_title(
+            sheets=sheets,
+            spreadsheet_id=latest_sheet_id,
+            desired_base_title=desired_base_title,
+            columns_count=4
+        )
+        print(f"[rotate] No rotation (size={size_mb:.2f} MB). Using file v{current_version}, tab: {target_tab}")
+        return latest_sheet_id, target_tab
+
+    # ROTATE → brand-new FILE
+    next_version = current_version + 1
+    print(f"[rotate] Threshold hit (size={size_mb:.2f} MB ≥ {size_threshold_mb} MB). Creating new file v{next_version}…")
+
+    new_sheet_id, new_tab_title = _create_new_spreadsheet_with_tab(sheets, store, next_version)
+    _persist_new_sheet_id(store, new_sheet_id)
+    print(f"[rotate] New spreadsheet created and persisted: v{next_version} id={new_sheet_id}, tab={new_tab_title}")
+
+    # From now on, append to the new file
+    return new_sheet_id, new_tab_title
+
+
+def _append_rows_csv_and_gsheet(
+    new_rows: list[dict],
+    store: str,
+    sheet_ids: dict,
+    sheet_json_path: str,
+    store_split_prefix: str,
+    google_client: gspread.Client,
+    progress: Callable[[str], None],
+    hard_size_threshold_mb: float,
+) -> None:
+    """Appends new rows to latest split file and sheet, and creates new one if too big."""
+    from utils.utils_io import save_csv_append, get_csv_size_mb, create_new_gsheet_tab
+
+    # Step 1: Determine current latest CSV
+    current_index = 1
+    while os.path.exists(f"{store_split_prefix}_{current_index}.csv"):
+        current_index += 1
+    latest_csv = f"{store_split_prefix}_{current_index - 1}.csv"
+    latest_size = get_csv_size_mb(latest_csv)
+    progress(f"[INFO] Latest CSV for store '{store}' is {latest_csv} ({latest_size:.2f} MB)")
+
+    # Step 2: Check if we need a new file
+    if latest_size >= hard_size_threshold_mb:
+        progress(f"[HARD] {latest_csv} is {latest_size:.2f} MB → ⛔ Creating a new Google Sheet tab")
+        current_index += 1
+        new_csv = f"{store_split_prefix}_{current_index}.csv"
+        save_csv_append(new_csv, new_rows)
+        progress(f"✅ Created new CSV: {new_csv}")
+
+        # Create new sheet tab
+        if store in sheet_ids:
+            parent_sheet_id = sheet_ids[store]["parent_sheet_id"]
+            new_tab_title = os.path.basename(new_csv)
+            sheet = google_client.open_by_key(parent_sheet_id)
+            sheet.add_worksheet(title=new_tab_title, rows="1000", cols="30")
+            sheet_ids[store][f"sheet_{current_index}"] = new_tab_title
+            progress(f"✅ Created new tab '{new_tab_title}' in Google Sheet")
+
+            # Save updated JSON map
+            with open(sheet_json_path, "w", encoding="utf-8") as f:
+                json.dump(sheet_ids, f, indent=2)
+            progress("✅ Updated shopify_sheet_ids.json with new sheet tab")
+
+            # Now append rows
+            ws = sheet.worksheet(new_tab_title)
+            ws.append_rows([list(row.values()) for row in new_rows])
+            progress(f"✅ Appended {len(new_rows)} row(s) to new tab '{new_tab_title}'")
+        else:
+            progress(f"[ERROR] No sheet ID found for store: {store}")
     else:
-        df.to_csv(csv_path, mode="a", header=False, index=False)
+        # No overflow, just append to existing CSV and sheet
+        save_csv_append(latest_csv, new_rows)
+        progress(f"✅ Appended {len(new_rows)} row(s) to existing CSV: {latest_csv}")
 
-    return csv_path
+        # Append to existing Google Sheet tab
+        if store in sheet_ids:
+            latest_tab = os.path.basename(latest_csv)
+            sheet = google_client.open_by_key(sheet_ids[store]["parent_sheet_id"])
+            ws = sheet.worksheet(latest_tab)
+            ws.append_rows([list(row.values()) for row in new_rows])
+            progress(f"✅ Appended {len(new_rows)} row(s) to Google Sheet tab '{latest_tab}'")
+        else:
+            progress(f"[ERROR] No sheet ID found for store: {store}")
 
 
 def _file_size_mb(path: str) -> float:
@@ -208,6 +388,15 @@ def _file_size_mb(path: str) -> float:
         return os.path.getsize(path) / (1024 * 1024)
     except OSError:
         return 0.0
+    
+def log_file_size_alert(path: str, label: str, progress: Optional[Callable[[str], None]]):
+    sz = _file_size_mb(path) #SIZE_WARN_MB, SIZE_ALERT_MB, SIZE_HARD_MB
+    if sz >= SIZE_HARD_MB:
+        log(f"[HARD] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
+    elif sz >= SIZE_ALERT_MB:
+        log(f"[ALERT] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
+    elif sz >= SIZE_WARN_MB:
+        log(f"[WARN] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
 
 
 # ---- Throttling helpers ----
@@ -322,29 +511,28 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
         log(f"🆕 Mapping not found. Building full mapping → {map_csv_path}", progress)
         rows = _fetch_products_variants(
             endpoint, headers, product_types, progress,
-            known_variant_ids=None, days_back=None  # full build ignores date filter
+            known_variant_ids=None, days_back=None
         )
-        # Write merged map
         pd.DataFrame(rows, columns=cols).to_csv(map_csv_path, index=False)
 
-        # Mirror to latest split (create if needed)
-        if latest_split_csv:
-            _append_rows_csv(rows, cols, latest_split_csv)
+        if latest_split_csv != map_csv_path:
+            csv_path, gsheet_id = get_latest_split_csv_and_gsheet_for_store(store)
+            validate_sheet_matches_csv(csv_path= csv_path, sheet_id= gsheet_id)
+            log(f"📤 Appending {len(rows)} new rows to Google Sheet ID: {gsheet_id}", progress)
 
-        # Size checks (split file only _ this is the one you watch)
-        if latest_split_csv:
-            used_path = _append_rows_csv(rows, cols, latest_split_csv, store=store)
-            sz = _file_size_mb(used_path)
-            if sz >= 90:
-                log(f"[HARD] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
-            elif sz >= 80:
-                log(f"[ALERT] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
-            elif sz >= 60:
-                log(f"[WARN] split file {os.path.basename(used_path)} = {sz:.2f} MB", progress)
-
+            used_path = _append_rows_csv_and_gsheet(
+                rows=rows,  # ✅ FIXED
+                columns=cols,
+                csv_path=csv_path,
+                store=store,
+                google_sheet_id=gsheet_id,
+                progress=progress,
+            )
+            log_file_size_alert(used_path, "split file", progress)
 
         log(f"✅ Mapping created with {len(rows)} variants.", progress)
         return len(rows), len(rows)
+
 
     # ---------- Incremental append ----------
     existing = pd.read_csv(map_csv_path, dtype=str)
@@ -357,21 +545,37 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
     )
 
     if new_rows:
-        # Append to merged map
-        _append_rows_csv(new_rows, cols, map_csv_path)
+        # Append to merged map first
+        last_sheet_id = SHEET_SOURCES[store][-1] if store in SHEET_SOURCES else None
+        _append_rows_csv_and_gsheet(
+            rows=new_rows,
+            columns=cols,
+            csv_path=latest_split_csv,
+            store=store,
+            google_sheet_id=last_sheet_id,
+            sheet_tab_name=get_sheet_tab_name_from_latest_split_csv(store),
+            progress=progress,
+        )
+
         log(f"➕ Added {len(new_rows)} new variants to mapping.", progress)
 
-        # Append to latest split
-        if latest_split_csv:
-            _append_rows_csv(new_rows, cols, latest_split_csv)
-            # Size checks after append
-            sz = _file_size_mb(latest_split_csv)
-            if sz >= 90:
-                log(f"[HARD] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
-            elif sz >= 80:
-                log(f"[ALERT] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
-            elif sz >= 60:
-                log(f"[WARN] latest split {os.path.basename(latest_split_csv)} = {sz:.2f} MB", progress)
+        # Check if any mismatch with registered sheet/CSV (defensive)
+        csv_path, gsheet_id = get_latest_split_csv_and_gsheet_for_store(store)
+        validate_sheet_matches_csv(csv_path=csv_path, sheet_id=gsheet_id)
+        if csv_path != latest_split_csv or gsheet_id != last_sheet_id:
+            _append_rows_csv_and_gsheet(
+                rows=new_rows,
+                columns=cols,
+                csv_path=csv_path,
+                store=store,
+                google_sheet_id=gsheet_id,
+                progress=progress,
+            )
+
+        # Always check the latest actual file size (even if append skipped)
+        log_file_size_alert(latest_split_csv, "split file", progress)
+
+
     else:
         log("✅ No new variants found.", progress)
 
@@ -379,10 +583,52 @@ def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
     return total_after, len(new_rows)
 
 
-
-# ---------------------------
+# ---------------------------   
 # Other helpers
 # ---------------------------
+
+def get_sheet_tab_name_from_latest_split_csv(store: str, base_dir: Optional[str] = None) -> Optional[str]:
+    import glob
+    base = base_dir or os.path.dirname(os.path.abspath(__file__))
+    utils_dir = os.path.join(base, "utils")
+    search_dir = utils_dir if os.path.isdir(utils_dir) else base
+
+    pattern = os.path.join(search_dir, f"shopify_inventory_map_{store}_*.csv")
+    candidates = []
+    for p in glob.glob(pattern):
+        m = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(p), re.I)
+        if m:
+            candidates.append((int(m.group(1)), p))
+
+    if not candidates:
+        raise ValueError(f"No split CSVs found for store '{store}' to infer tab name.")
+
+    candidates.sort(key=lambda t: t[0])
+    latest_version = candidates[-1][0]
+    return f"shopify_inventory_map_{store}_{latest_version}"
+
+
+def validate_sheet_matches_csv(csv_path: str, sheet_id: str):
+    # Just a sanity check to help during dev
+    basename = os.path.basename(csv_path)
+    match = re.match(r"shopify_inventory_map_([a-z0-9]+)_(\d+)\.csv", basename)
+    if not match:
+        return
+    store, version = match.group(1), int(match.group(2))
+    expected_id = SHEET_SOURCES[store][version - 1]
+    if expected_id != sheet_id:
+        print(f"[WARN] GSheet mismatch: expected {expected_id}, got {sheet_id}")
+
+
+def get_latest_split_csv_and_gsheet_for_store(store: str) -> tuple[str, Optional[str]]:
+    """
+    Returns:
+      - path to latest local split CSV for the store
+      - Google Sheet ID of last sheet for this store, or None if not found
+    """
+    latest_csv = _latest_split_csv_for_store(store)
+    last_sheet_id = SHEET_SOURCES[store][-1] if store in SHEET_SOURCES else None
+    return latest_csv, last_sheet_id
 
 def load_shared_stock_csv(path: str) -> Dict[str, int]:
     if not os.path.exists(path):
@@ -492,7 +738,12 @@ def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional
         raise
 
     # 🔄 Refresh Google Sheet data (export + merge)
-    refresh_csvs(force_refresh=force_refresh_google_sheets, progress=progress)
+    refresh_csvs(
+        force_refresh=force_refresh_google_sheets,
+        progress=progress,
+        stores=[store]  # 👈 only the current store
+    )
+
 
 
     if build_map or not os.path.exists(map_csv):

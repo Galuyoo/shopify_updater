@@ -1,13 +1,14 @@
 # ---- Size check helpers: latest = highest numeric suffix only ----
 import re
 from pathlib import Path
+from merge_google_sheets_for_stores import SIZE_WARN_MB, SIZE_ALERT_MB, SIZE_HARD_MB
 
 # Only match suffixed parts: shopify_inventory_map_<store>_<N>.csv
 PART_RE = re.compile(r"^shopify_inventory_map_(?P<store>[a-z0-9_-]+)_(?P<num>\d+)\.csv$", re.IGNORECASE)
 
-WARN_MB = 90.0
-ALERT_MB = 95.0
-HARD_MB = 100.0
+WARN_MB = SIZE_WARN_MB
+ALERT_MB = SIZE_ALERT_MB
+HARD_MB = SIZE_HARD_MB
 
 def file_size_mb(path: Path) -> float:
     return path.stat().st_size / (1024 * 1024)

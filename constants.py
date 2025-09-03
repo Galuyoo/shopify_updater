@@ -5,6 +5,12 @@ SLEEP_BETWEEN_CALLS = 0.3
 RETRY_429_MAX = 5
 STOCK_CSV_PATH = "Stock_Update.csv"
 
+# Size thresholds in MB for split files
+SIZE_WARN_MB = 40
+SIZE_ALERT_MB = 50
+SIZE_HARD_MB = 60
+
+
 size_map = {
     "XS": "XS", "Small": "S", "Medium": "M", "Large": "L",
     "XL": "XL", "2XL": "2XL", "3XL": "3XL", "4XL": "4XL", "5XL": "5XL"

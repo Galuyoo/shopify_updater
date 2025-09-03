@@ -3,3 +3,4 @@ update_report_*.csv
 .env
 .history
 *.json
+.streamlit/

@@ -1,15 +1,22 @@
 # app.py
 import streamlit as st
-import pandas as pd
 import tempfile
-
+import sys
 from constants import BATCH_SIZE_DEFAULT
 from core import run_update
 from store_profiles import STORE_PROFILES
+from utils.ui_utils import setup_log_state, reset_ui_state, make_push_with_status, render_all_sections
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 st.set_page_config(page_title="Shopify Stock Updater", page_icon="📦", layout="centered")
 st.title("📦 Shopify Stock Updater")
 
+# ---------------- Sidebar / Controls ----------------
 with st.sidebar:
     st.header("Run options")
     store = st.selectbox("Store", list(STORE_PROFILES.keys()), index=1)
@@ -21,23 +28,24 @@ with st.sidebar:
     build_map = st.checkbox("Build/refresh mapping before run", value=False)
     map_csv_override = st.text_input("Mapping CSV override (optional)", "")
     stock_csv_override = st.text_input("Stock CSV override (optional)", "")
-    force_refresh = st.checkbox("🔄 Force refresh Google Sheets (re-download all CSVs)", value=True)
+    force_refresh = st.checkbox("🔄 Force refresh Google Sheets", value=True)
     stock_csv_upload = st.file_uploader("Upload Stock CSV", type=["csv"])
 
 run_btn = st.button("Run update", type="primary")
 
-log_box = st.empty()
-log_lines = []
+# ---------------- Setup UI + Logging ----------------
+setup_log_state()
+render_all_sections()
+status_placeholder = st.empty()
+st.session_state["status_placeholder"] = status_placeholder
+push = make_push_with_status(status_placeholder)
 
-def push(msg: str):
-    log_lines.append(msg)
-    log_box.text("\n".join(log_lines[-40:]))
-
+# ---------------- Run Workflow ----------------
 if run_btn:
-    # Build filters first
-    pts = [s.strip() for s in product_types_in.split(",") if s.strip()] if product_types_in else None
+    reset_ui_state()
+    status_placeholder.info("⏳ Starting…")
 
-    # Persist uploaded CSV to a temp file (if provided)
+    pts = [s.strip() for s in product_types_in.split(",") if s.strip()] if product_types_in else None
     tmp_stock_path = None
     if stock_csv_upload is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
@@ -51,21 +59,21 @@ if run_btn:
                 sku_prefix=sku_prefix or None,
                 product_types=pts,
                 location_name=location_name or None,
-                batch_size=int(batch_size),
+                batch_size=batch_size,
                 map_csv=map_csv_override or None,
                 stock_csv_path=tmp_stock_path or (stock_csv_override or None),
                 dry_run=dry_run,
                 build_map=build_map,
                 store_profiles=STORE_PROFILES,
                 progress=push,
-                force_refresh_google_sheets=force_refresh,  # 👈 PASS THIS
+                force_refresh_google_sheets=force_refresh,
             )
-
         except FileNotFoundError as e:
             st.error(str(e))
             st.stop()
 
-    st.success("Done.")
+    status_placeholder.success("✅ Update complete.")
+
     st.subheader("Summary")
     st.json(summary)
 
