@@ -4,3 +4,16 @@ update_report_*.csv
 .history
 *.json
 .streamlit/
+.venv/
+venv/
+__pycache__/
+*.pyc
+store_profiles.json
+# Local venv + secrets
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+store_profiles.json
+
