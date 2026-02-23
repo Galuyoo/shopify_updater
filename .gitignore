@@ -15,3 +15,6 @@ __pycache__/
 *.pyc
 .env
 
+
+store_profiles.json
+
