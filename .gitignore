@@ -1,0 +1,9 @@
+shopify_inventory_map_*.csv
+update_report_*.csv
+.env
+.history
+.app/*.json
+*.csv
+.app/ralawise.py 
+.streamlit/secrets.toml
+.data/
