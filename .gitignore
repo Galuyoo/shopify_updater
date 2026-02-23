@@ -7,3 +7,11 @@ update_report_*.csv
 .app/ralawise.py 
 .streamlit/secrets.toml
 .data/
+
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+
