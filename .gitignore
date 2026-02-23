@@ -1,20 +1,20 @@
-shopify_inventory_map_*.csv
-update_report_*.csv
+# --- Secrets (NEVER commit) ---
 .env
-.history
-.app/*.json
-*.csv
-.app/ralawise.py 
 .streamlit/secrets.toml
-.data/
+app/store_profiles.json
 
-# Virtual environments
+# --- Local / runtime dirs ---
 .venv/
 venv/
 __pycache__/
 *.pyc
-.env
+.history/
+logs/
+*.log
 
-
-store_profiles.json
-
+# --- Data outputs (generated) ---
+data/
+app/data/
+*.csv
+shopify_inventory_map_*.csv
+update_report_*.csv
