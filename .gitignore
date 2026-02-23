@@ -18,3 +18,7 @@ app/data/
 *.csv
 shopify_inventory_map_*.csv
 update_report_*.csv
+
+# Runtime state
+app/utils/_state/
+
