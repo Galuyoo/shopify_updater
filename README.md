@@ -1,147 +1,70 @@
-# 🚀 Shopify Inventory Updater — Headless 24/7 Service
-
-A fully autonomous, production-grade Shopify inventory synchronization system.
-
-This version (`main` branch) represents the evolution of the project from a Streamlit UI tool into a continuously running backend service that updates inventory across multiple Shopify stores using supplier stock feeds.
-
----
-
-## 🧠 System Evolution
-
-This repository contains two architectural generations:
-
-- **main** → Headless 24/7 autonomous inventory synchronization service (production system)
-- **legacy-streamlit-ui** → Original Streamlit-based Google Sheets uploader
-
-The system was refactored from a manual UI-driven workflow into a scheduled infrastructure service designed for continuous operation.
-
----
-
-## ⚙️ What It Does
-
-- 🔄 Runs 24/7 via Task Scheduler / cron
-- 📡 Fetches live supplier stock feeds (Ralawise, Uneek)
-- 🗺 Maintains local inventory mapping per store
-- 🔍 Detects new Shopify variants automatically
-- 🔗 Matches SKUs with translation logic when required
-- 📦 Updates inventory via Shopify GraphQL API in controlled batches
-- 📊 Generates per-cycle update reports
-- 📧 Emails success, unmatched SKUs, and failed mutation reports
-- 🛑 Prevents unsafe full rebuilds for large stores
-
----
-
-## 🏗 Architecture Overview
-app/
-    │
-    ├── service_runner.py # 24/7 scheduler entrypoint
-    ├── core.py # Main orchestration logic
-    ├── stock_sources.py # Supplier stock aggregation
-    ├── ralawise.py # Ralawise integration
-    ├── uneek.py # Uneek integration
-    ├── store_profiles.py # Per-store configuration loader
-    ├── utils/
-             └── emailer.py # Automated reporting system
-             
-
----
-
-## 🔁 Runtime Flow
-
-1. Scheduler triggers `service_runner.py`
-2. Stock feeds fetched once per cycle
-3. For each store:
-   - Mapping refreshed incrementally
-   - SKU matching performed
-   - GraphQL inventory updates batched
-   - Unmatched + failure reports generated
-4. Email summary sent
-5. Sleep → next cycle
-
----
-
-## 📊 Scale
-
-Designed to handle:
-
-- Tens of thousands of variants per store
-- Multi-store architecture
-- Batched GraphQL updates
-- Continuous incremental mapping growth
-- Translation-based SKU normalization
-
----
-
-## 🛡 Safety Mechanisms
-
-- Prevents accidental full rebuild on large stores
-- Controlled batch sizes
-- Duplicate SKU detection
-- Unmatched SKU reporting
-- Error isolation per store
-- Graceful stock feed fallback
-
----
-
-## 🔐 Configuration
-
-Each store is defined in:
-app/store_profiles.json 
-
-Secrets are never committed. Use:
-
-- `.env`
-- `store_profiles.json` (ignored by git)
-- `store_profiles.example.json` (template)
-
----
-
-## 🚀 Running the Service
-
-### Windows (Task Scheduler)
-python app/service_runner.py
-
-### Linux (cron)
-*/30**** python /path/to/service_runner.py
-
----
-
-## 🧩 Dependencies
+# 🛒 Shopify Inventory Updater A modular tool to automatically upload and rotate large Shopify CSV exports into Google Sheets — organized by store, split by size, and tracked across versions. --- ## 📦 Features - 🔍 Detects large CSVs and splits them automatically - 📤 Uploads CSVs to Google Sheets (auto or manual) - 🧠 Maintains mapping in sheet_sources.json - ✅ Supports both local and Streamlit environments - 🧪 CLI test runner: test_sheet_rotation.py - 🔒 Secure auth with .streamlit/secrets.toml or fallback JSON --- ## 🧰 Project Structure
+shopify_updater/
+│
+├── app.py                      # Streamlit app
+├── cli.py                      # Optional CLI interface
+├── constants.py                # Size limits and global config
+├── core.py                     # Core logic (if used)
+├── store_profiles.py           # Store configuration (if used)
+│
+├── .streamlit/
+│   └── secrets.toml            # [google_service_account] credentials
+│
+├── scripts/
+│   └── ermgi.py                # External scripts or helpers
+│
+├── utils/
+│   ├── google_service_account.json   # Optional local fallback auth
+│   ├── gsheets_manager.py            # All Sheets/Drive logic
+│   ├── utils_io.py                   # CSV uploaders
+│   ├── ui_utils.py                   # Streamlit utilities
+│   ├── sheet_sources.json            # Mapping of store → list of sheet IDs
+│   ├── sheet_config.py               # Extra sheet options (if used)
+│   └── test_sheet_rotation.py        # Local test entrypoint
+--- ## 🔐 Authentication Setup ### 1. Preferred: .streamlit/secrets.toml
+toml
+[google_service_account]
+type = "service_account"
+project_id = "…"
+private_key_id = "…"
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "your-service-account@project.iam.gserviceaccount.com"
+client_id = "…"
+✅ Used automatically in Streamlit. ✅ Manually loaded in CLI via toml.load(). --- ### 2. Optional: google_service_account.json
+bash
+utils/google_service_account.json
+Used when not running inside Streamlit and secrets.toml is missing. --- ## 🚀 Usage ### ▶️ 1. CLI Test Upload
+bash
+python utils/test_sheet_rotation.py
+Behavior: - Checks size of shopify_inventory_map_<store>_<N>.csv - If oversized: creates new Google Sheet, uploads, updates JSON ### 💻 2. In Streamlit (app.py) Import and use:
+python
+from utils.utils_io import upload_csv_to_gsheet
+from utils.gsheets_manager import get_first_sheet_title
+Sheet selection:
+python
+# Use latest known Google Sheet
+with open("utils/sheet_sources.json") as f:
+    sheet_ids = json.load(f)[store_name]
+    latest_id = sheet_ids[-1]
+--- ## ✍️ Manual Sheet Management If Drive quota prevents automatic creation: 1. Create a Google Sheet manually 2. Copy its ID 3. Add it to utils/sheet_sources.json:
+json
+{
+  "spoofy": [
+    "1st_sheet_id",
+    "2nd_sheet_id",
+    "your_new_sheet_id"
+  ]
+}
+4. Rerun your app --- ## ⚠️ Known Limitations | Limitation | Status | Notes | |--------------------------|---------------|----------------------------------| | Drive quota issues | ⚠️ In manual mode | Use personal Google account or clear service account Drive | Folder auto-move | ❌ Skipped | Folder ID can be manually added | Ownership transfer | ❌ Skipped | Optional, not reliable via API | Sheet ID registry growth | ✅ Handled | Appends to sheet_sources.json --- ## 📦 Dependencies
+streamlit
 pandas
-requests
-python-dotenv
-
-install:
+google-api-python-client
+google-auth
+google-auth-oauthlib
+toml
+Install via:
+bash
 pip install -r requirements.txt
-
----
-
-## 📸 24/7 Service Evidence
-
-The system runs continuously on a dedicated machine and emails per-cycle reports.
-
-(See `/docs/` for runtime logs.)
-
----
-
-## 📈 Why This Matters
-
-This project demonstrates:
-
-- Architectural refactoring from UI tool → backend infrastructure
-- Multi-store system design
-- External supplier API integration
-- Automated data reconciliation
-- Production-safe deployment practices
-- Version-controlled evolution
-
----
-
-## 📌 Legacy Version
-
-To view the original Streamlit UI implementation:
-
-Switch to branch:
-legacy-streamlit-ui
-
----
+--- ## ✅ Ready to Deploy This setup works in: - ✅ Local CLI - ✅ Streamlit Cloud - ✅ Scheduled automation (later) --- 
+## 📬 Questions? 
+Reach out if you need help integrating Google Drive, S3, or switching to BigQuery. ---
