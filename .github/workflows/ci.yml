@@ -25,3 +25,6 @@ jobs:
       - name: Verify code compiles
         run: |
           python -m compileall .
+      - name: Run tests
+        run: |
+          pytest -q

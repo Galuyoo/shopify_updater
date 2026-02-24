@@ -9,3 +9,4 @@ openpyxl
 gspread
 oauth2client
 python-dotenv
+pytest

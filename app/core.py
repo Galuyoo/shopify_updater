@@ -4,9 +4,8 @@ from typing import List, Dict, Optional, Callable, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
-from ralawise import get_stock
-
-from constants import (
+from .ralawise import get_stock
+from .constants import (
     API_VERSION, BATCH_SIZE_DEFAULT, SLEEP_BETWEEN_CALLS, RETRY_429_MAX,
     STOCK_CSV_PATH, size_map, colour_map
 )
@@ -930,7 +929,7 @@ def run_update(*,
 
     # --- STOCK: prefer provided DF, otherwise fetch combined stock DF (ralawise etc.) ---
     if stock_csv_df is None:
-        from stock_sources import build_combined_stock_df
+        from .stock_sources import build_combined_stock_df
         stock_csv_df = build_combined_stock_df(prefer="ralawise", progress=progress)
 
     if "sku" not in stock_csv_df.columns or "free" not in stock_csv_df.columns:
