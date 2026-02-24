@@ -1,147 +1,162 @@
-# 🚀 Shopify Inventory Updater — Headless 24/7 Service
+![CI](https://github.com/Galuyoo/shopify_updater/actions/workflows/ci.yml/badge.svg)
 
-A fully autonomous, production-grade Shopify inventory synchronization system.
+# Multi-Source Inventory Reconciliation Engine
 
-This version (`main` branch) represents the evolution of the project from a Streamlit UI tool into a continuously running backend service that updates inventory across multiple Shopify stores using supplier stock feeds.
+A headless, multi-tenant inventory synchronization engine designed to
+reconcile heterogeneous supplier stock feeds into distributed e-commerce
+storefronts.
 
----
+This system was independently engineered and deployed within a warehouse
+operational environment to provide continuous, automated stock
+synchronization across multiple Shopify stores.
 
-## 🧠 System Evolution
+------------------------------------------------------------------------
 
-This repository contains two architectural generations:
+## 🚀 Problem Context
 
-- **main** → Headless 24/7 autonomous inventory synchronization service (production system)
-- **legacy-streamlit-ui** → Original Streamlit-based Google Sheets uploader
+The warehouse operated multiple storefronts dependent on two separate
+suppliers.
 
-The system was refactored from a manual UI-driven workflow into a scheduled infrastructure service designed for continuous operation.
+Technical challenges included:
 
----
+-   Inconsistent SKU naming conventions across suppliers
+-   Mismatched SKU namespaces between suppliers and storefronts
+-   Tens of thousands of product variants per store
+-   Risk of destructive or incorrect stock overwrites
+-   Manual reconciliation bottlenecks
+-   Need for continuous 24/7 execution
 
-## ⚙️ What It Does
+This project was designed to solve these problems through architectural
+decoupling and automation.
 
-- 🔄 Runs 24/7 via Task Scheduler / cron
-- 📡 Fetches live supplier stock feeds (Ralawise, Uneek)
-- 🗺 Maintains local inventory mapping per store
-- 🔍 Detects new Shopify variants automatically
-- 🔗 Matches SKUs with translation logic when required
-- 📦 Updates inventory via Shopify GraphQL API in controlled batches
-- 📊 Generates per-cycle update reports
-- 📧 Emails success, unmatched SKUs, and failed mutation reports
-- 🛑 Prevents unsafe full rebuilds for large stores
+------------------------------------------------------------------------
 
----
+## 🧠 Core Technical Innovations
 
-## 🏗 Architecture Overview
-app/
-    │
-    ├── service_runner.py # 24/7 scheduler entrypoint
-    ├── core.py # Main orchestration logic
-    ├── stock_sources.py # Supplier stock aggregation
-    ├── ralawise.py # Ralawise integration
-    ├── uneek.py # Uneek integration
-    ├── store_profiles.py # Per-store configuration loader
-    ├── utils/
-             └── emailer.py # Automated reporting system
-             
+### 1️⃣ SKU Namespace Decoupling & Translation Layer
 
----
+A custom reconciliation layer was built to:
 
-## 🔁 Runtime Flow
+-   Establish a canonical internal SKU namespace
+-   Translate supplier-specific SKUs into internal identifiers
+-   Normalize and validate SKU mappings
+-   Isolate unmatched identifiers
+-   Prevent incorrect stock propagation
 
-1. Scheduler triggers `service_runner.py`
-2. Stock feeds fetched once per cycle
-3. For each store:
-   - Mapping refreshed incrementally
-   - SKU matching performed
-   - GraphQL inventory updates batched
-   - Unmatched + failure reports generated
-4. Email summary sent
-5. Sleep → next cycle
+This allows supplier systems and storefront systems to evolve
+independently while maintaining synchronization integrity.
 
----
+------------------------------------------------------------------------
 
-## 📊 Scale
+### 2️⃣ Single-Fetch Multi-Store Cycle Architecture
 
-Designed to handle:
+Instead of querying suppliers per store, the engine:
 
-- Tens of thousands of variants per store
-- Multi-store architecture
-- Batched GraphQL updates
-- Continuous incremental mapping growth
-- Translation-based SKU normalization
+-   Fetches supplier stock once per execution cycle
+-   Reuses normalized data across all stores
+-   Minimizes API calls and rate-limit pressure
+-   Enables scalable multi-tenant synchronization
 
----
+This design significantly improves efficiency and resilience.
 
-## 🛡 Safety Mechanisms
+------------------------------------------------------------------------
 
-- Prevents accidental full rebuild on large stores
-- Controlled batch sizes
-- Duplicate SKU detection
-- Unmatched SKU reporting
-- Error isolation per store
-- Graceful stock feed fallback
+### 3️⃣ Autonomous 24/7 Execution Model
 
----
+The system was operationalized as a continuously running service:
 
-## 🔐 Configuration
+-   Headless execution (no UI dependency)
+-   Scheduled cycle-based execution
+-   Per-cycle reconciliation reporting
+-   Structured diagnostic attachments
+-   Store-level isolation to prevent cross-impact
 
-Each store is defined in:
-app/store_profiles.json 
+The engine runs autonomously within warehouse infrastructure and
+provides operational visibility through automated email reporting.
 
-Secrets are never committed. Use:
+------------------------------------------------------------------------
 
-- `.env`
-- `store_profiles.json` (ignored by git)
-- `store_profiles.example.json` (template)
+## 🏗 High-Level Architecture
 
----
+Supplier A API ----\
+\
+--\> Stock Ingestion Layer / Supplier B API ----/
 
-## 🚀 Running the Service
+            ↓
 
-### Windows (Task Scheduler)
-python app/service_runner.py
+SKU Translation / Normalization Layer
 
-### Linux (cron)
-*/30**** python /path/to/service_runner.py
+            ↓
 
----
+Reconciliation Engine - mapping validation - difference detection -
+safety checks
 
-## 🧩 Dependencies
-pandas
-requests
-python-dotenv
+            ↓
 
-install:
-pip install -r requirements.txt
+Batch Update Executor (Per-Store Isolation)
 
----
+            ↓
 
-## 📸 24/7 Service Evidence
+Reporting & Notification Layer
 
-The system runs continuously on a dedicated machine and emails per-cycle reports.
+------------------------------------------------------------------------
 
-(See `/docs/` for runtime logs.)
+## 🔒 Safety & Reliability Features
 
----
+-   Validation before stock overwrite
+-   Isolation between storefront executions
+-   Unmatched SKU reporting
+-   Failed update tracking
+-   Structured cycle summaries
+-   Error containment per store
 
-## 📈 Why This Matters
+------------------------------------------------------------------------
 
-This project demonstrates:
+## 📊 Operational Characteristics
 
-- Architectural refactoring from UI tool → backend infrastructure
-- Multi-store system design
-- External supplier API integration
-- Automated data reconciliation
-- Production-safe deployment practices
-- Version-controlled evolution
+-   Processes tens of thousands of variants per store
+-   Designed for continuous 24/7 execution
+-   Multi-tenant store isolation
+-   Supplier API-efficient architecture
+-   Structured reporting per execution cycle
 
----
+------------------------------------------------------------------------
 
-## 📌 Legacy Version
+## 📂 Documentation
 
-To view the original Streamlit UI implementation:
+-   docs/INNOVATION.md -- Detailed technical innovation analysis
+-   docs/ARCHITECTURE.md -- System architecture and design principles
+-   docs/IMPACT.md -- Operational and engineering impact
 
-Switch to branch:
-legacy-streamlit-ui
+------------------------------------------------------------------------
 
----
+## 🛠 Technology Stack
+
+-   Python
+-   Shopify Admin API
+-   Supplier API integrations
+-   Pandas (data reconciliation layer)
+-   Windows Task Scheduler (deployment orchestration)
+
+------------------------------------------------------------------------
+
+## ⚙ Execution Example
+
+*/30 * \* \* \* python service_runner.py
+
+Runs the reconciliation cycle every 30 minutes.
+
+------------------------------------------------------------------------
+
+## 📌 Engineering Scope
+
+This repository demonstrates:
+
+-   Cross-system namespace reconciliation design
+-   Multi-source stock ingestion architecture
+-   Multi-tenant execution isolation
+-   API-efficient synchronization strategy
+-   Real-world autonomous deployment
+
+This is infrastructure-level automation engineering rather than a simple
+update script.
