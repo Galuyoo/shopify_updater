@@ -1,15 +1,17 @@
 
-# 🛒 Shopify Inventory Updater
-
-A modular tool to automatically upload and rotate large Shopify CSV exports into Google Sheets — organized by store, split by size, and tracked across versions.
-
----
 
 ⚠️ Legacy Debug / UI Branch
 
 This branch contains the earlier Streamlit-based UI version of the system, now retained for debugging and controlled troubleshooting.
 
 The production architecture is implemented in the `main` branch as a headless 24/7 service.
+
+
+# 🛒 Shopify Inventory Updater
+
+A modular tool to automatically upload and rotate large Shopify CSV exports into Google Sheets — organized by store, split by size, and tracked across versions.
+
+---
 
 ## 📦 Features
 
