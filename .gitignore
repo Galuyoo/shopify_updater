@@ -22,3 +22,7 @@ update_report_*.csv
 # Runtime state
 app/utils/_state/
 
+data/logs/
+*.log
+utils/_reports/
+utils/_state/
