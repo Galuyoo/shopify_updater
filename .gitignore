@@ -13,9 +13,14 @@ logs/
 *.log
 
 # --- Data outputs (generated) ---
-data/
+data/*
+!data/amazon_listing_map.example.csv
+data/amazon_listing_map.csv
+data/maps/
 app/data/
+reports/amazon/
 *.csv
+!data/amazon_listing_map.example.csv
 shopify_inventory_map_*.csv
 update_report_*.csv
 

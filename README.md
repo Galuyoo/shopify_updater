@@ -160,3 +160,48 @@ This repository demonstrates:
 
 This is infrastructure-level automation engineering rather than a simple
 update script.
+
+------------------------------------------------------------------------
+
+## Amazon Stock Dry Run
+
+The first Amazon phase is report-only. It reads the existing supplier stock
+feeds, reads an Amazon listing map CSV, matches `canonical_sku` to
+`amazon_seller_sku`, and writes dry-run reports. It does not call Amazon
+SP-API and does not require Amazon credentials.
+
+Run from the project root:
+
+```bash
+python -m app.amazon_dry_run --listing-map data/amazon_listing_map.csv --out-dir reports/amazon --prefer ralawise
+```
+
+The real listing map is local-only and should not be committed:
+
+```text
+data/amazon_listing_map.csv
+```
+
+Use this committed template for the required columns:
+
+```text
+data/amazon_listing_map.example.csv
+```
+
+Required columns:
+
+```text
+canonical_sku,amazon_seller_sku,asin,marketplace_id,fulfillment_channel,enabled
+```
+
+Generated reports:
+
+-   `amazon_stock_dry_run_YYYYMMDD_HHMMSS.csv`
+-   `amazon_unmatched_skus_YYYYMMDD_HHMMSS.csv`
+-   `amazon_duplicate_amazon_seller_sku_YYYYMMDD_HHMMSS.csv`
+-   `amazon_duplicate_canonical_sku_YYYYMMDD_HHMMSS.csv`
+-   `amazon_stock_dry_run_summary_YYYYMMDD_HHMMSS.json`
+
+Duplicate `amazon_seller_sku` rows are errors. Duplicate `canonical_sku`
+rows are warnings because one supplier SKU may intentionally feed multiple
+Amazon listings.
