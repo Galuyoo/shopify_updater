@@ -1,0 +1,28 @@
+# --- Secrets (NEVER commit) ---
+.env
+.streamlit/secrets.toml
+app/store_profiles.json
+
+# --- Local / runtime dirs ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+.history/
+logs/
+*.log
+
+# --- Data outputs (generated) ---
+data/
+app/data/
+*.csv
+shopify_inventory_map_*.csv
+update_report_*.csv
+
+# Runtime state
+app/utils/_state/
+
+data/logs/
+*.log
+utils/_reports/
+utils/_state/

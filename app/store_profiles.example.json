@@ -1,0 +1,22 @@
+{
+  "WWJ": {
+    "SHOP_URL": "...",
+    "ACCESS_TOKEN": "..."
+  },    
+  "paddy": {
+    "SHOP_URL": "...",
+    "ACCESS_TOKEN": "..."
+  },
+  "spoofy": {
+    "SHOP_URL": "...",
+    "ACCESS_TOKEN": "..."
+  },
+  "FullyBlessed": {
+    "SHOP_URL": "...",
+    "ACCESS_TOKEN": "..."
+  },
+  "flairmerchandise": {
+    "SHOP_URL": "...",
+    "ACCESS_TOKEN": "..."
+  }
+}
