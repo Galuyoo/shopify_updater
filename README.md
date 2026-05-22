@@ -205,3 +205,42 @@ Generated reports:
 Duplicate `amazon_seller_sku` rows are errors. Duplicate `canonical_sku`
 rows are warnings because one supplier SKU may intentionally feed multiple
 Amazon listings.
+
+## Amazon Price/Inventory Upload Build
+
+Place the raw Seller Central export here:
+
+```text
+data/amazon_export_raw.txt
+```
+
+The export must include at least these columns:
+
+```text
+sku, asin, price, quantity
+```
+
+Build the listing map, dry-run report, and official Price/Inventory upload
+file from the project root:
+
+```bash
+python -m app.amazon_build_upload --amazon-export data/amazon_export_raw.txt --out-dir reports/amazon --prefer ralawise --include-reviewed-shared-stock
+```
+
+The final Seller Central upload file is created in:
+
+```text
+reports/amazon/amazon_price_inventory_ALL_YYYYMMDD_HHMMSS.txt
+```
+
+Upload that `.txt` manually through Seller Central Price/Inventory upload.
+This command does not call Amazon SP-API.
+
+Do not commit real Amazon exports, generated listing maps, dry-run reports,
+or upload files:
+
+```text
+data/amazon_export_raw.txt
+data/amazon_listing_map.csv
+reports/amazon/
+```

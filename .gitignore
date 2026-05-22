@@ -31,3 +31,6 @@ data/logs/
 *.log
 utils/_reports/
 utils/_state/
+
+reports/amazon/
+data/amazon_export_raw.txt
