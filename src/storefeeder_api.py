@@ -14,6 +14,7 @@ from .stock_mapping import STRICT_REPORT_STATUS_COLUMN, STRICT_STATUS_UPDATE_REA
 
 MAX_STOREFEEDER_BATCH_SIZE = 50
 STOREFEEDER_STOCK_LOCATION_INVENTORY_PATH = "/products/stocklocationinventory"
+STOREFEEDER_SUPPLIER_INVENTORY_COST_PATH = "/products/productsuppliers/inventory-cost"
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,181 @@ def build_stock_location_inventory_payload_preview(
         }
     )
     return preview.reset_index(drop=True)
+
+
+def build_supplier_inventory_cost_payload_preview(
+    api_payload_preview: pd.DataFrame,
+    supplier_id_map: pd.DataFrame,
+    *,
+    api_limit: int | None = None,
+    supplier_costs: int = 0,
+) -> pd.DataFrame:
+    required = ["ProductID", "SKU", "supplier", "supplier_sku", "quantity", STRICT_REPORT_STATUS_COLUMN]
+    missing = [column for column in required if column not in api_payload_preview.columns]
+    if missing:
+        raise ValueError("Supplier API payload preview missing required columns: " + ", ".join(missing))
+    if api_limit is not None and api_limit < 0:
+        raise ValueError("--api-limit must be zero or greater")
+
+    rows = api_payload_preview.copy()
+    rows[STRICT_REPORT_STATUS_COLUMN] = rows[STRICT_REPORT_STATUS_COLUMN].fillna("").astype(str).str.strip()
+    rows = rows[rows[STRICT_REPORT_STATUS_COLUMN].eq(STRICT_STATUS_UPDATE_READY)].copy()
+    update_ready_count_before_limit = len(rows)
+    rows["_source_row_number"] = rows.index + 2
+    rows["_ProductID_text"] = rows["ProductID"].fillna("").astype(str).str.strip()
+    rows["_SKU_text"] = rows["SKU"].fillna("").astype(str).str.strip()
+    rows["_supplier_text"] = rows["supplier"].fillna("").astype(str).str.strip()
+    rows["_supplier_sku_text"] = rows["supplier_sku"].fillna("").astype(str).str.strip()
+    rows = _merge_supplier_id_map(rows, supplier_id_map)
+    rows["_quantity_numeric"] = pd.to_numeric(rows["quantity"], errors="coerce")
+    rows["_supplier_id_numeric"] = pd.to_numeric(rows["_SupplierID_text"], errors="coerce")
+    rows["_invalid_reason"] = rows.apply(_invalid_supplier_payload_reason, axis=1)
+
+    invalid_rows = rows[rows["_invalid_reason"].ne("")].copy()
+    if not invalid_rows.empty:
+        invalid_report = invalid_rows[
+            [
+                "_source_row_number",
+                "ProductID",
+                "SKU",
+                "supplier",
+                "supplier_sku",
+                "quantity",
+                STRICT_REPORT_STATUS_COLUMN,
+                "_invalid_reason",
+            ]
+        ].rename(columns={"_source_row_number": "source_row_number", "_invalid_reason": "invalid_reason"})
+        raise ApiPayloadValidationError("StoreFeeder supplier API payload validation failed; invalid update_ready rows found", invalid_report)
+
+    valid_rows_before_limit = int(rows["_invalid_reason"].eq("").sum())
+    if update_ready_count_before_limit != valid_rows_before_limit:
+        raise ApiPayloadValidationError(
+            f"StoreFeeder supplier API row-count assertion failed: update_ready={update_ready_count_before_limit}, valid={valid_rows_before_limit}",
+            pd.DataFrame(columns=["source_row_number", "ProductID", "SKU", "supplier", "supplier_sku", "quantity", STRICT_REPORT_STATUS_COLUMN, "invalid_reason"]),
+        )
+
+    rows["SupplierStockLevel"] = rows["_quantity_numeric"].astype(int)
+    rows["Supplier.SupplierID"] = rows["_supplier_id_numeric"].astype(int)
+    if api_limit is not None:
+        rows = rows.head(api_limit)
+
+    preview = pd.DataFrame(
+        {
+            "ProductID": rows["_ProductID_text"],
+            "SKU": rows["_SKU_text"],
+            "supplier": rows["_supplier_text"],
+            "supplier_sku": rows["_supplier_sku_text"],
+            "quantity": rows["SupplierStockLevel"],
+            STRICT_REPORT_STATUS_COLUMN: rows[STRICT_REPORT_STATUS_COLUMN],
+            "ProductIDType.IDType": "ID",
+            "ProductIDType.Value": rows["_ProductID_text"],
+            "Supplier.SupplierID": rows["Supplier.SupplierID"],
+            "Supplier.Name": rows["_SupplierName_text"],
+            "SupplierSKU": rows["_supplier_sku_text"],
+            "SupplierStockLevel": rows["SupplierStockLevel"],
+            "SupplierCosts": int(supplier_costs),
+        }
+    )
+    return preview.reset_index(drop=True)
+
+
+def supplier_payload_preview_to_items(preview: pd.DataFrame) -> list[dict[str, Any]]:
+    required = [
+        "ProductIDType.IDType",
+        "ProductIDType.Value",
+        "Supplier.SupplierID",
+        "Supplier.Name",
+        "SupplierSKU",
+        "SupplierStockLevel",
+        "SupplierCosts",
+        STRICT_REPORT_STATUS_COLUMN,
+    ]
+    missing = [column for column in required if column not in preview.columns]
+    if missing:
+        raise ValueError("Supplier API payload preview missing required columns: " + ", ".join(missing))
+    disallowed = preview[~preview[STRICT_REPORT_STATUS_COLUMN].astype(str).str.strip().eq(STRICT_STATUS_UPDATE_READY)]
+    if not disallowed.empty:
+        raise ValueError("Supplier API payload contains rows that are not update_ready")
+
+    items: list[dict[str, Any]] = []
+    for _, row in preview.iterrows():
+        items.append(
+            {
+                "ProductIDType": {
+                    "IDType": str(row["ProductIDType.IDType"]).strip(),
+                    "Value": str(row["ProductIDType.Value"]).strip(),
+                },
+                "Supplier": {
+                    "SupplierID": int(row["Supplier.SupplierID"]),
+                    "Name": str(row["Supplier.Name"]).strip(),
+                },
+                "SupplierSKU": str(row["SupplierSKU"]).strip(),
+                "SupplierStockLevel": int(row["SupplierStockLevel"]),
+                "SupplierCosts": int(row["SupplierCosts"]),
+            }
+        )
+    return items
+
+
+def normalize_supplier_id_map(supplier_id_map: pd.DataFrame) -> pd.DataFrame:
+    required = ["supplier", "SupplierID", "Supplier.Name"]
+    missing = [column for column in required if column not in supplier_id_map.columns]
+    if missing:
+        raise ValueError("StoreFeeder supplier ID map missing required columns: " + ", ".join(missing))
+
+    normalized = supplier_id_map[required].copy()
+    for column in required:
+        normalized[column] = normalized[column].fillna("").astype(str).str.strip()
+    normalized = normalized[normalized["supplier"].ne("")].copy()
+    normalized["_supplier_key"] = normalized["supplier"].str.casefold()
+    duplicate_keys = normalized[normalized["_supplier_key"].duplicated(keep=False)]["_supplier_key"].unique()
+    if len(duplicate_keys) > 0:
+        raise ValueError("StoreFeeder supplier ID map has duplicate supplier rows: " + ", ".join(sorted(duplicate_keys)))
+    return normalized
+
+
+def _merge_supplier_id_map(rows: pd.DataFrame, supplier_id_map: pd.DataFrame) -> pd.DataFrame:
+    normalized_map = normalize_supplier_id_map(supplier_id_map)
+    mapped = rows.copy()
+    mapped["_supplier_key"] = mapped["_supplier_text"].str.casefold()
+    mapped = mapped.merge(
+        normalized_map[["_supplier_key", "SupplierID", "Supplier.Name"]],
+        how="left",
+        on="_supplier_key",
+    )
+    mapped["_SupplierID_text"] = mapped["SupplierID"].fillna("").astype(str).str.strip()
+    mapped["_SupplierName_text"] = mapped["Supplier.Name"].fillna("").astype(str).str.strip()
+    mapped = mapped.drop(columns=["SupplierID", "Supplier.Name", "_supplier_key"])
+    return mapped
+
+
+def _invalid_supplier_payload_reason(row: pd.Series) -> str:
+    reasons = []
+    if not row["_ProductID_text"]:
+        reasons.append("missing_storefeeder_product_id")
+    elif not str(row["_ProductID_text"]).isdigit():
+        reasons.append("non_integer_storefeeder_product_id")
+    if not row["_SKU_text"]:
+        reasons.append("blank_SKU")
+    if not row["_supplier_text"]:
+        reasons.append("missing_supplier_mapping")
+    if not row["_supplier_sku_text"]:
+        reasons.append("missing_supplier_sku_mapping")
+    if not row["_SupplierID_text"]:
+        reasons.append("missing_supplier_id_mapping")
+    elif pd.isna(row["_supplier_id_numeric"]) or float(row["_supplier_id_numeric"]) != int(row["_supplier_id_numeric"]):
+        reasons.append("non_integer_supplier_id")
+    if not row["_SupplierName_text"]:
+        reasons.append("missing_supplier_name_mapping")
+    quantity = row["_quantity_numeric"]
+    if pd.isna(quantity):
+        reasons.append("missing_or_non_numeric_quantity")
+    else:
+        if float(quantity) < 0:
+            reasons.append("negative_quantity")
+        if float(quantity) != int(quantity):
+            reasons.append("non_integer_quantity")
+    return "|".join(reasons)
 
 
 def normalize_stock_location_id_map(stock_location_id_map: pd.DataFrame) -> pd.DataFrame:
@@ -285,6 +461,34 @@ class StoreFeederApiClient:
             time.sleep(10)
             self.rate_limiter.wait()
             response = self.session.put(url, json=batch, timeout=self.config.timeout_seconds)
+            response_json = _response_json(response)
+
+        total_processed = _int_from_response(response_json, "TotalItemsProcessed", default=len(batch))
+        successful = _int_from_response(response_json, "Successful", default=0)
+        failed = _int_from_response(response_json, "Failed", default=len(batch) if response.status_code >= 400 else 0)
+        if response.status_code >= 400 and failed == 0:
+            failed = len(batch)
+        return StoreFeederBatchResult(
+            batch_number=batch_number,
+            requested_count=len(batch),
+            status_code=response.status_code,
+            total_processed=total_processed,
+            successful=successful,
+            failed=failed,
+            response_json=response_json,
+        )
+
+    def update_product_supplier_inventory_cost(self, batch: list[dict[str, Any]], *, batch_number: int) -> StoreFeederBatchResult:
+        if len(batch) > MAX_STOREFEEDER_BATCH_SIZE:
+            raise ValueError("StoreFeeder API batch exceeds 50 products")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + STOREFEEDER_SUPPLIER_INVENTORY_COST_PATH
+        response = self.session.patch(url, json=batch, timeout=self.config.timeout_seconds)
+        response_json = _response_json(response)
+        if response.status_code == 409:
+            time.sleep(10)
+            self.rate_limiter.wait()
+            response = self.session.patch(url, json=batch, timeout=self.config.timeout_seconds)
             response_json = _response_json(response)
 
         total_processed = _int_from_response(response_json, "TotalItemsProcessed", default=len(batch))

@@ -15,12 +15,16 @@ logs/
 # --- Data outputs (generated) ---
 data/*
 !data/amazon_listing_map.example.csv
+!data/storefeeder_stock_location_ids.csv
+!data/storefeeder_supplier_ids.csv
 data/amazon_listing_map.csv
 data/maps/
 app/data/
 reports/amazon/
 *.csv
 !data/amazon_listing_map.example.csv
+!data/storefeeder_stock_location_ids.csv
+!data/storefeeder_supplier_ids.csv
 shopify_inventory_map_*.csv
 update_report_*.csv
 

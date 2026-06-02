@@ -16,8 +16,10 @@ from src.storefeeder_api import (
     StoreFeederApiClient,
     StoreFeederApiConfig,
     batch_items,
+    build_supplier_inventory_cost_payload_preview,
     build_stock_location_inventory_payload_preview,
     payload_preview_to_storefeeder_items,
+    supplier_payload_preview_to_items,
     validate_api_batch_size,
 )
 from src.storefeeder_stock_export import (
@@ -45,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-unusual-update-count", action="store_true", help="Do not block when update count differs sharply from previous run")
     parser.add_argument("--live-api", action="store_true", help="Validate live API gate and produce API payload preview only; no API call is made")
     parser.add_argument("--api-live", action="store_true", help="Send StoreFeeder stock location inventory updates. Default is dry-run with zero API calls")
+    parser.add_argument("--supplier-api-live", action="store_true", help="Send StoreFeeder product supplier inventory updates. Default is dry-run with zero API calls")
     parser.add_argument("--allow-unsafe-storefeeder-api-experiment", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--api-limit", type=int, help="Cap API payload rows after validation. Required for guarded live API runs")
     parser.add_argument("--api-batch-size", default=50, type=int, help="StoreFeeder API batch size, maximum 50")
@@ -52,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storefeeder-stock-location-id-map", type=Path, help="CSV mapping stock_location to StoreFeeder StockLocationID.IDType and StockLocationID.Value")
     parser.add_argument("--storefeeder-stock-location-id-type", default="StockLocationReference", help="StoreFeeder StockLocationID.IDType for API payloads")
     parser.add_argument("--storefeeder-stock-location-id-value-column", default="stock_location", help="Column to use for StockLocationID.Value in API payloads")
+    parser.add_argument("--storefeeder-supplier-id-map", default=Path("data/storefeeder_supplier_ids.csv"), type=Path, help="CSV mapping supplier to StoreFeeder SupplierID and Supplier.Name")
     parser.add_argument("--export", action="store_true", help="Write ready files and reports. Default is dry-run only")
     parser.add_argument("--legacy-3-column-export", action="store_true", help="Build the old 3-column stock update file instead of strict full import")
     parser.add_argument("--limit-preview", default=20, type=int, help="Preview row count")
@@ -108,11 +112,12 @@ def main() -> int:
         allow_quarantine_update=args.allow_quarantine_update,
         max_quarantine_rate=args.max_quarantine_rate,
         max_stock_file_age_hours=args.max_stock_file_age_hours,
-        live_mode=args.live_api or args.api_live,
+        live_mode=args.live_api or args.api_live or args.supplier_api_live,
         allow_unusual_update_count=args.allow_unusual_update_count,
         previous_update_ready_count=previous_ready_count,
     )
     stock_location_id_map = _read_stock_location_id_map(args.storefeeder_stock_location_id_map)
+    supplier_id_map = _read_supplier_id_map(args.storefeeder_supplier_id_map)
 
     try:
         api_payload_preview = build_stock_location_inventory_payload_preview(
@@ -139,6 +144,30 @@ def main() -> int:
         print("\nNo StoreFeeder API calls were made.")
         return 2
 
+    try:
+        supplier_api_payload_preview = build_supplier_inventory_cost_payload_preview(
+            result.api_payload_preview,
+            supplier_id_map,
+            api_limit=args.api_limit,
+        )
+    except ApiPayloadValidationError as exc:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        invalid_rows_path = args.out_dir / "supplier_api_payload_invalid_rows.csv"
+        exc.invalid_rows.to_csv(invalid_rows_path, index=False)
+        if args.export:
+            files = write_strict_storefeeder_stock_export(
+                result,
+                args.out_dir,
+                write_ready_files=result.safety_passed,
+            )
+            api_payload_preview.to_csv(files.api_payload_preview, index=False)
+            _print_files(files)
+        print("\nSUPPLIER API PAYLOAD SAFETY FAILURE:")
+        print(str(exc))
+        print(f"Invalid rows report: {invalid_rows_path}")
+        print("\nNo StoreFeeder API calls were made.")
+        return 2
+
     print("Strict StoreFeeder stock update dry run" if not args.export else "Strict StoreFeeder stock update export")
     print(result.validation_summary.to_string(index=False))
     print("\nReady rows preview:")
@@ -147,6 +176,8 @@ def main() -> int:
     print(result.quarantine_review.head(args.limit_preview).to_string(index=False))
     print("\nAPI payload preview:")
     print(api_payload_preview.head(args.limit_preview).to_string(index=False))
+    print("\nSupplier API payload preview:")
+    print(supplier_api_payload_preview.head(args.limit_preview).to_string(index=False))
 
     if not result.live_update_allowed:
         print("\nLIVE/EXPORT GATE BLOCKED:")
@@ -158,7 +189,7 @@ def main() -> int:
     if not args.export:
         _print_api_summary(
             dry_run=True,
-            api_live=args.api_live,
+            api_live=args.api_live or args.supplier_api_live,
             rows_eligible_for_api=len(result.api_payload_preview),
             rows_sent_to_api=0,
             batches_sent=0,
@@ -175,9 +206,11 @@ def main() -> int:
         write_ready_files=result.safety_passed,
     )
     api_payload_preview.to_csv(files.api_payload_preview, index=False)
-    _print_files(files, no_api_calls=not args.api_live)
+    supplier_api_payload_preview_path = args.out_dir / "supplier_api_payload_preview.csv"
+    supplier_api_payload_preview.to_csv(supplier_api_payload_preview_path, index=False)
+    _print_files(files, no_api_calls=not args.api_live and not args.supplier_api_live)
 
-    if not args.api_live:
+    if not args.api_live and not args.supplier_api_live:
         _print_api_summary(
             dry_run=True,
             api_live=False,
@@ -186,11 +219,14 @@ def main() -> int:
             batches_sent=0,
             successful=0,
             failed=0,
-            report_paths={"api_payload_preview": str(files.api_payload_preview)},
+            report_paths={
+                "api_payload_preview": str(files.api_payload_preview),
+                "supplier_api_payload_preview": str(supplier_api_payload_preview_path),
+            },
         )
         return 0
 
-    if not args.allow_unsafe_storefeeder_api_experiment:
+    if args.api_live and not args.allow_unsafe_storefeeder_api_experiment:
         _print_api_summary(
             dry_run=True,
             api_live=True,
@@ -203,14 +239,36 @@ def main() -> int:
         )
         raise SystemExit("Blocked: StoreFeeder API stock update semantics are not verified. Live API updates are disabled.")
 
+    if args.supplier_api_live and args.api_limit is None:
+        raise SystemExit("Blocked StoreFeeder supplier API live update because --api-limit is required for guarded initial runs.")
     if not result.safety_passed:
-        raise SystemExit("Blocked StoreFeeder API live update because safety_passed is not True.")
+        raise SystemExit("Blocked StoreFeeder live update because safety_passed is not True.")
     if len(result.quarantine_review) != 0:
-        raise SystemExit("Blocked StoreFeeder API live update because quarantined rows are present.")
+        raise SystemExit("Blocked StoreFeeder live update because quarantined rows are present.")
     if not result.live_update_allowed:
-        raise SystemExit("Blocked StoreFeeder API live update because live_update_allowed is not yes: " + "|".join(result.blocked_reasons))
-    if args.api_limit is None:
+        raise SystemExit("Blocked StoreFeeder live update because live_update_allowed is not yes: " + "|".join(result.blocked_reasons))
+    if args.api_live and args.api_limit is None:
         raise SystemExit("Blocked StoreFeeder API live update because --api-limit is required for guarded initial runs.")
+
+    if args.supplier_api_live:
+        items = supplier_payload_preview_to_items(supplier_api_payload_preview)
+        batches = batch_items(items, args.api_batch_size)
+        client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
+        supplier_api_report_paths = _send_storefeeder_supplier_api_batches(client, batches, args.out_dir)
+        _print_api_summary(
+            dry_run=False,
+            api_live=True,
+            rows_eligible_for_api=len(result.api_payload_preview),
+            rows_sent_to_api=len(items),
+            batches_sent=len(batches),
+            successful=_sum_csv_column(supplier_api_report_paths["supplier_api_update_batches"], "successful"),
+            failed=_sum_csv_column(supplier_api_report_paths["supplier_api_update_batches"], "failed"),
+            report_paths={
+                "supplier_api_payload_preview": str(supplier_api_payload_preview_path),
+                **{k: str(v) for k, v in supplier_api_report_paths.items()},
+            },
+        )
+        return 0
 
     items = payload_preview_to_storefeeder_items(api_payload_preview)
     batches = batch_items(items, args.api_batch_size)
@@ -251,6 +309,10 @@ def _read_previous_update_ready_count(path: Path) -> int | None:
 def _read_stock_location_id_map(path: Path | None) -> pd.DataFrame | None:
     if path is None:
         return None
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def _read_supplier_id_map(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype=str, keep_default_na=False)
 
 
@@ -303,6 +365,47 @@ def _send_storefeeder_api_batches(client: StoreFeederApiClient, batches: list[li
     return paths
 
 
+def _send_storefeeder_supplier_api_batches(client: StoreFeederApiClient, batches: list[list[dict]], out_dir: Path) -> dict[str, Path]:
+    paths = {
+        "supplier_api_update_success": out_dir / "supplier_api_update_success.csv",
+        "supplier_api_update_failures": out_dir / "supplier_api_update_failures.csv",
+        "supplier_api_update_batches": out_dir / "supplier_api_update_batches.csv",
+        "supplier_api_update_raw_responses": out_dir / "supplier_api_update_raw_responses.json",
+    }
+    success_rows = []
+    failure_rows = []
+    batch_rows = []
+    raw_responses = []
+    for batch_number, batch in enumerate(batches, start=1):
+        result = client.update_product_supplier_inventory_cost(batch, batch_number=batch_number)
+        batch_rows.append(
+            {
+                "batch_number": result.batch_number,
+                "requested_count": result.requested_count,
+                "status_code": result.status_code,
+                "total_processed": result.total_processed,
+                "successful": result.successful,
+                "failed": result.failed,
+            }
+        )
+        raw_responses.append(
+            {
+                "batch_number": result.batch_number,
+                "status_code": result.status_code,
+                "response": result.response_json,
+            }
+        )
+        target_rows = failure_rows if result.status_code >= 400 or result.failed else success_rows
+        for item in batch:
+            target_rows.append(_supplier_api_item_report_row(batch_number, item, result.status_code))
+
+    pd.DataFrame(success_rows).to_csv(paths["supplier_api_update_success"], index=False)
+    pd.DataFrame(failure_rows).to_csv(paths["supplier_api_update_failures"], index=False)
+    pd.DataFrame(batch_rows).to_csv(paths["supplier_api_update_batches"], index=False)
+    paths["supplier_api_update_raw_responses"].write_text(json.dumps(raw_responses, indent=2), encoding="utf-8")
+    return paths
+
+
 def _api_item_report_row(batch_number: int, item: dict, status_code: int) -> dict[str, object]:
     return {
         "batch_number": batch_number,
@@ -312,6 +415,19 @@ def _api_item_report_row(batch_number: int, item: dict, status_code: int) -> dic
         "stock_location_id_value": item["StockLocationID"]["Value"],
         "adjustment_type": item["AdjustmentType"],
         "adjustment_amount": item["AdjustmentAmount"],
+    }
+
+
+def _supplier_api_item_report_row(batch_number: int, item: dict, status_code: int) -> dict[str, object]:
+    return {
+        "batch_number": batch_number,
+        "status_code": status_code,
+        "ProductID": item["ProductIDType"]["Value"],
+        "SupplierID": item["Supplier"]["SupplierID"],
+        "Supplier.Name": item["Supplier"]["Name"],
+        "SupplierSKU": item["SupplierSKU"],
+        "SupplierStockLevel": item["SupplierStockLevel"],
+        "SupplierCosts": item["SupplierCosts"],
     }
 
 

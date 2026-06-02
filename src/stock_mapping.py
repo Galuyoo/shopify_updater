@@ -632,7 +632,10 @@ def build_strict_storefeeder_stock_import(
         mapping_skus_missing_rows,
         columns=REQUIRED_MAPPING_COLUMNS + ["reason"],
     )
-    api_payload_preview = pd.DataFrame(api_rows, columns=["SKU", "stock_location", "quantity", STRICT_REPORT_STATUS_COLUMN])
+    api_payload_preview = pd.DataFrame(
+        api_rows,
+        columns=["ProductID", "SKU", "supplier", "supplier_sku", "stock_location", "quantity", STRICT_REPORT_STATUS_COLUMN],
+    )
 
     safety_passed, unexpected_columns = _validate_ready_export_safety(original, ready_export)
     blocked_reasons = _final_blocked_reasons(
@@ -769,7 +772,10 @@ def _api_rows_for_sku(product_update: pd.Series, ready_details: list[dict[str, o
     rows = []
     for detail in ready_details:
         rows.append({
+            "ProductID": product_update.get("ID", ""),
             "SKU": product_update["SKU"],
+            "supplier": detail["supplier"],
+            "supplier_sku": detail["supplier_sku"],
             "stock_location": detail["stock_location"],
             "quantity": detail["safe_stock"],
             STRICT_REPORT_STATUS_COLUMN: STRICT_STATUS_UPDATE_READY,
