@@ -244,3 +244,129 @@ data/amazon_export_raw.txt
 data/amazon_listing_map.csv
 reports/amazon/
 ```
+
+## StoreFeeder Stock Update Export
+
+This tool builds strict, warehouse-safe StoreFeeder stock-location update files for manual upload/testing. It does not call the StoreFeeder API and does not update StoreFeeder directly.
+
+Inputs:
+
+- latest full StoreFeeder product export after supplier/location mapping
+- `supplier_mapping.csv`
+- Ralawise stock CSV
+- Uneek stock CSV, if available
+
+Required mapping CSV columns:
+
+```text
+storefeeder_sku,supplier,supplier_sku,stock_location
+```
+
+Ralawise stock CSV columns:
+
+```text
+SKU,free,DiscontinuedStatus
+```
+
+Uneek stock CSV/API-output can use `ItemNo` plus `Stock`/`StockLevel`, or normalized `sku,free` output.
+
+Default mode is dry-run. It prints the validation gate, ready-row preview, quarantine preview, and API payload preview without writing files:
+
+```powershell
+python scripts/build_storefeeder_stock_update.py --storefeeder-export data/storefeeder_products.xlsx --supplier-mapping data/supplier_mapping.csv --ralawise-stock data/RALAWISE_stock_lvl.csv --uneek-stock data/Uneek_stock_levels.csv --out-dir reports/storefeeder --buffer 0 --max-stock 5
+```
+
+Add `--export` to write files. The main CSV/XLSX outputs include only `update_ready` rows. Quarantined rows are never included in the API payload preview.
+
+Stock rule:
+
+```text
+final_stock = min(max(supplier_stock - buffer, 0), max_stock)
+```
+
+Defaults:
+
+- `buffer = 0`
+- `max_stock = 5`
+- `--missing-as-zero` is false by default
+- `--max-quarantine-rate = 0.02`
+- `--max-stock-file-age-hours = 24`
+
+Strict safety behavior:
+
+- preserves StoreFeeder columns and original column order in ready exports
+- updates only `Stock Location Current Inventories`
+- treats `supplier_mapping.csv` as the update universe; StoreFeeder rows outside the mapping are skipped, not quarantined
+- keeps `Suppliers`, `Supplier SKUs`, and `Stock Locations` exactly as they are in the StoreFeeder export
+- aligns pipe-separated inventory values to the matching existing stock location
+- blocks ready export if any original column other than `Stock Location Current Inventories` changes
+- blocks the live/API gate when quarantine rate is too high against mapped update candidates, stock files are stale, duplicate/conflict rows exist, or update count is unusual compared with a previous run
+
+Quarantine categories include:
+
+```text
+missing_supplier_mapping
+missing_supplier_sku_in_stock_feed
+duplicate_storefeeder_sku
+duplicate_supplier_mapping_conflict
+invalid_supplier_name
+stock_location_supplier_mismatch
+invalid_stock_quantity
+negative_stock_quantity
+colour_size_validation_failed
+ambiguous_match
+stale_supplier_stock_file
+discontinued_supplier_sku
+unknown_error
+```
+
+Each output includes a `confidence_status` column with one of:
+
+```text
+update_ready
+quarantined
+skipped
+```
+
+Generated files:
+
+- `storefeeder_stock_updates_ready.csv`
+- `storefeeder_stock_updates_ready.xlsx`
+- `quarantine_review.csv`
+- `zero_stock_updates.csv`
+- `missing_supplier_skus.csv`
+- `skipped_not_in_supplier_mapping.csv`
+- `mapping_skus_missing_from_storefeeder_export.csv`
+- `validation_summary.csv`
+- `api_payload_preview.csv`
+
+Useful flags:
+
+- `--missing-as-zero`: treat missing supplier stock as zero instead of quarantining it
+- `--allow-quarantine-update`: diagnostic override for report/export gates; quarantined rows still do not enter API payload preview
+- `--max-quarantine-rate 0.02`: block when quarantine rate is above the configured threshold
+- `--max-stock-file-age-hours 24`: block when supplier stock files are stale
+- `--previous-update-ready-count N`: block unusually low/high update counts compared with a known previous run
+- `--allow-unusual-update-count`: do not block on unusual update count
+- `--live-api`: runs the live gate and produces API payload preview only; no StoreFeeder API call is made
+
+Example alignment:
+
+```text
+Stock Locations = Ralawise|Uneek
+Stock Location Current Inventories = 0|0
+```
+
+Updating Uneek to 5 produces:
+
+```text
+Stock Location Current Inventories = 0|5
+```
+
+The old 3-column export is still available only for debugging:
+
+```powershell
+python scripts/build_storefeeder_stock_update.py --legacy-3-column-export --supplier-mapping data/supplier_mapping.csv --ralawise-stock data/RALAWISE_stock_lvl.csv --out-dir reports/storefeeder
+```
+
+
