@@ -506,6 +506,17 @@ class StoreFeederApiClient:
             response_json=response_json,
         )
 
+    def get_product_suppliers(self, product_id: str) -> dict[str, Any]:
+        product_id = str(product_id).strip()
+        if not product_id:
+            raise ValueError("ProductID is required for StoreFeeder supplier readback")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + f"/products/{product_id}/productsuppliers"
+        response = self.session.get(url, timeout=self.config.timeout_seconds)
+        payload = _response_json(response)
+        payload["_status_code"] = response.status_code
+        return payload
+
 
 def fetch_storefeeder_access_token(config: StoreFeederApiConfig) -> str:
     username = os.getenv("STOREFEEDER_API_USERNAME", "").strip()
