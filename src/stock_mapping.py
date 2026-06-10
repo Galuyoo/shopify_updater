@@ -391,6 +391,24 @@ def _find_location_index(locations: list[str], stock_location: str) -> int | Non
     return None
 
 
+def _product_supplier_exists(product: pd.Series, supplier: str, supplier_sku: str) -> bool:
+    expected_supplier = str(supplier).strip().casefold()
+    expected_supplier_sku = str(supplier_sku).strip().casefold()
+    if not expected_supplier or not expected_supplier_sku:
+        return False
+
+    suppliers = _split_pipe_values(product.get("Suppliers", ""))
+    supplier_skus = _split_pipe_values(product.get("Supplier SKUs", ""))
+    for index, supplier_value in enumerate(suppliers):
+        supplier_sku_value = supplier_skus[index] if index < len(supplier_skus) else ""
+        if supplier_value.strip().casefold() == expected_supplier and supplier_sku_value.strip().casefold() == expected_supplier_sku:
+            return True
+
+    supplier_match_anywhere = any(value.strip().casefold() == expected_supplier for value in suppliers)
+    supplier_sku_match_anywhere = any(value.strip().casefold() == expected_supplier_sku for value in supplier_skus)
+    return supplier_match_anywhere and supplier_sku_match_anywhere
+
+
 def _skipped_row(storefeeder_sku: str, supplier: str, supplier_sku: str, stock_location: str, reason: str) -> dict[str, str]:
     return {
         "SKU": storefeeder_sku,
@@ -431,6 +449,7 @@ VALIDATION_CATEGORIES = [
 ]
 VALID_SUPPLIERS = {"RALAWISE", "UNEEK"}
 STRICT_STATUS_UPDATE_READY = "update_ready"
+STRICT_STATUS_SUPPLIER_SETUP_NEEDED = "supplier_setup_needed"
 STRICT_STATUS_QUARANTINED = "quarantined"
 STRICT_STATUS_SKIPPED = "skipped"
 STRICT_ALLOWED_CHANGED_COLUMNS = ["Stock Location Current Inventories"]
@@ -464,6 +483,8 @@ class StrictStockSafetyConfig:
 class StrictStoreFeederStockResult:
     ready_export: pd.DataFrame
     quarantine_review: pd.DataFrame
+    supplier_setup_needed: pd.DataFrame
+    mapping_ready_but_supplier_missing: pd.DataFrame
     zero_stock_updates: pd.DataFrame
     missing_supplier_skus: pd.DataFrame
     skipped_not_in_supplier_mapping: pd.DataFrame
@@ -498,6 +519,7 @@ def build_strict_storefeeder_stock_import(
     ready_rows: list[dict[str, object]] = []
     zero_rows: list[dict[str, object]] = []
     missing_rows: list[dict[str, object]] = []
+    supplier_setup_rows: list[dict[str, object]] = []
     skipped_not_in_mapping_rows: list[dict[str, object]] = []
     api_rows: list[dict[str, object]] = []
 
@@ -562,11 +584,6 @@ def build_strict_storefeeder_stock_import(
                 product_quarantine.append(_quarantine_row(product, sku, supplier, supplier_sku, stock_location, "stale_supplier_stock_file", "Supplier stock file is older than configured limit"))
                 continue
 
-            location_index = _find_location_index(locations, stock_location)
-            if location_index is None:
-                product_quarantine.append(_quarantine_row(product, sku, supplier, supplier_sku, stock_location, "stock_location_supplier_mismatch", "Mapping stock_location is not present in StoreFeeder Stock Locations"))
-                continue
-
             stock_row = stock_by_key.get((supplier_key, supplier_sku.casefold()))
             if stock_row is None:
                 missing = _quarantine_row(product, sku, supplier, supplier_sku, stock_location, "missing_supplier_sku_in_stock_feed", "Supplier SKU not found in stock feed")
@@ -588,6 +605,35 @@ def build_strict_storefeeder_stock_import(
                 supplier_qty = int(stock_row["supplier_free_stock"])
 
             safe_stock = min(max(supplier_qty - config.buffer, 0), config.max_stock)
+            if not _product_supplier_exists(product, supplier, supplier_sku):
+                supplier_setup_rows.append(
+                    _supplier_setup_row(
+                        product,
+                        sku,
+                        supplier,
+                        supplier_sku,
+                        stock_location,
+                        supplier_qty,
+                        "Mapping validates against supplier stock, but Product Supplier record is missing in StoreFeeder",
+                    )
+                )
+                continue
+
+            api_rows.append(
+                {
+                    "ProductID": product_update.get("ID", ""),
+                    "SKU": sku,
+                    "supplier": supplier,
+                    "supplier_sku": supplier_sku,
+                    "stock_location": stock_location,
+                    "quantity": int(safe_stock),
+                    STRICT_REPORT_STATUS_COLUMN: STRICT_STATUS_UPDATE_READY,
+                }
+            )
+            location_index = _find_location_index(locations, stock_location)
+            if location_index is None:
+                continue
+
             inventories[location_index] = str(int(safe_stock))
             ready_detail = {
                 "SKU": sku,
@@ -621,10 +667,11 @@ def build_strict_storefeeder_stock_import(
             ready_rows[-1]["details"] = "|".join(
                 f"{row['supplier']}:{row['supplier_sku']}:{row['stock_location']}={row['safe_stock']}" for row in sku_ready_rows
             )
-            api_rows.extend(_api_rows_for_sku(product_update, sku_ready_rows))
 
     ready_export = _ready_export_dataframe(ready_rows, original.columns)
     quarantine_review = pd.DataFrame(quarantine_rows, columns=_quarantine_columns())
+    supplier_setup_needed = pd.DataFrame(supplier_setup_rows, columns=_supplier_setup_columns())
+    mapping_ready_but_supplier_missing = supplier_setup_needed.copy()
     zero_stock_updates = pd.DataFrame(zero_rows, columns=_detail_columns())
     missing_supplier_skus = pd.DataFrame(missing_rows, columns=_quarantine_columns())
     skipped_not_in_supplier_mapping = pd.DataFrame(skipped_not_in_mapping_rows, columns=SKIPPED_REPORT_COLUMNS)
@@ -656,6 +703,7 @@ def build_strict_storefeeder_stock_import(
         update_candidate_product_skus_count=len(update_candidate_product_skus),
         ready_count=len(ready_export),
         quarantined_count=len(quarantine_review),
+        supplier_setup_needed_count=len(supplier_setup_needed),
         skipped_not_in_mapping_count=len(skipped_not_in_supplier_mapping),
         mapping_missing_from_export_count=len(mapping_skus_missing_from_storefeeder_export),
         zero_count=len(zero_stock_updates),
@@ -671,6 +719,8 @@ def build_strict_storefeeder_stock_import(
     return StrictStoreFeederStockResult(
         ready_export=ready_export,
         quarantine_review=quarantine_review,
+        supplier_setup_needed=supplier_setup_needed,
+        mapping_ready_but_supplier_missing=mapping_ready_but_supplier_missing,
         zero_stock_updates=zero_stock_updates,
         missing_supplier_skus=missing_supplier_skus,
         skipped_not_in_supplier_mapping=skipped_not_in_supplier_mapping,
@@ -752,8 +802,27 @@ def _quarantine_row(product, sku: str, supplier: str, supplier_sku: str, stock_l
     }
 
 
+def _supplier_setup_row(product, sku: str, supplier: str, supplier_sku: str, stock_location: str, supplier_qty: int, reason: str) -> dict[str, object]:
+    return {
+        "SKU": sku,
+        "Name": str(product.get("Name", "")),
+        "ProductID": str(product.get("ID", "")),
+        "supplier": supplier,
+        "supplier_sku": supplier_sku,
+        "stock_location": stock_location,
+        "supplier_free_stock": int(supplier_qty),
+        "validation_category": STRICT_STATUS_SUPPLIER_SETUP_NEEDED,
+        STRICT_REPORT_STATUS_COLUMN: STRICT_STATUS_SUPPLIER_SETUP_NEEDED,
+        "reason": reason,
+    }
+
+
 def _quarantine_columns() -> list[str]:
     return ["SKU", "Name", "supplier", "supplier_sku", "stock_location", "validation_category", STRICT_REPORT_STATUS_COLUMN, "reason"]
+
+
+def _supplier_setup_columns() -> list[str]:
+    return ["SKU", "Name", "ProductID", "supplier", "supplier_sku", "stock_location", "supplier_free_stock", "validation_category", STRICT_REPORT_STATUS_COLUMN, "reason"]
 
 
 def _detail_columns() -> list[str]:
@@ -839,6 +908,7 @@ def _strict_validation_summary(
     update_candidate_product_skus_count: int,
     ready_count: int,
     quarantined_count: int,
+    supplier_setup_needed_count: int,
     skipped_not_in_mapping_count: int,
     mapping_missing_from_export_count: int,
     zero_count: int,
@@ -856,6 +926,8 @@ def _strict_validation_summary(
         {"metric": "update_candidate_mapping_rows", "value": int(update_candidate_mapping_rows)},
         {"metric": "update_candidate_product_skus", "value": int(update_candidate_product_skus_count)},
         {"metric": "update_ready_count", "value": int(ready_count)},
+        {"metric": "stock_update_ready_count", "value": int(ready_count)},
+        {"metric": "supplier_setup_needed_count", "value": int(supplier_setup_needed_count)},
         {"metric": "quarantined_count", "value": int(quarantined_count)},
         {"metric": "skipped_not_in_supplier_mapping_count", "value": int(skipped_not_in_mapping_count)},
         {"metric": "mapping_skus_missing_from_storefeeder_export_count", "value": int(mapping_missing_from_export_count)},

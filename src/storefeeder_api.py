@@ -15,6 +15,7 @@ from .stock_mapping import STRICT_REPORT_STATUS_COLUMN, STRICT_STATUS_UPDATE_REA
 MAX_STOREFEEDER_BATCH_SIZE = 50
 STOREFEEDER_STOCK_LOCATION_INVENTORY_PATH = "/products/stocklocationinventory"
 STOREFEEDER_SUPPLIER_INVENTORY_COST_PATH = "/products/productsuppliers/inventory-cost"
+STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE = "/products/{product_id}/productsuppliers"
 
 
 @dataclass(frozen=True)
@@ -506,16 +507,95 @@ class StoreFeederApiClient:
             response_json=response_json,
         )
 
+    def get_products_page(self, *, page: int = 1, page_size: int = 100) -> dict[str, Any]:
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if page_size < 1:
+            raise ValueError("page_size must be at least 1")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + "/products"
+        response = self.session.get(
+            url,
+            params={"page": page, "pageSize": page_size},
+            timeout=self.config.timeout_seconds,
+        )
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
+    def get_product(self, product_id: str) -> dict[str, Any]:
+        product_id = str(product_id).strip()
+        if not product_id:
+            raise ValueError("ProductID is required")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + f"/products/{product_id}"
+        response = self.session.get(url, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
     def get_product_suppliers(self, product_id: str) -> dict[str, Any]:
         product_id = str(product_id).strip()
         if not product_id:
-            raise ValueError("ProductID is required for StoreFeeder supplier readback")
+            raise ValueError("ProductID is required")
         self.rate_limiter.wait()
-        url = self.config.base_url.rstrip("/") + f"/products/{product_id}/productsuppliers"
+        path = STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE.format(product_id=product_id)
+        url = self.config.base_url.rstrip("/") + path
         response = self.session.get(url, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
+    def get_path(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        path = str(path).strip()
+        if not path:
+            raise ValueError("API path is required")
+        if not path.startswith("/"):
+            path = "/" + path
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + path
+        response = self.session.get(url, params=params, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
+    def options_path(self, path: str) -> dict[str, Any]:
+        path = str(path).strip()
+        if not path:
+            raise ValueError("API path is required")
+        if not path.startswith("/"):
+            path = "/" + path
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + path
+        response = self.session.options(url, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "allow": response.headers.get("Allow", ""),
+            "response": _response_json(response),
+        }
+
+    def create_product_supplier(self, product_id: str, item: dict[str, Any]) -> dict[str, Any]:
+        product_id = str(product_id).strip()
+        if not product_id:
+            raise ValueError("ProductID is required for StoreFeeder supplier setup")
+        self.rate_limiter.wait()
+        path = STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE.format(product_id=product_id)
+        url = self.config.base_url.rstrip("/") + path
+        response = self.session.post(url, json=item, timeout=self.config.timeout_seconds)
         payload = _response_json(response)
-        payload["_status_code"] = response.status_code
-        return payload
+        if response.status_code == 409:
+            time.sleep(10)
+            self.rate_limiter.wait()
+            response = self.session.post(url, json=item, timeout=self.config.timeout_seconds)
+            payload = _response_json(response)
+        return {
+            "_status_code": response.status_code,
+            "response": payload,
+        }
 
 
 def fetch_storefeeder_access_token(config: StoreFeederApiConfig) -> str:

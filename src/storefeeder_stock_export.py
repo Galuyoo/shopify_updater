@@ -47,6 +47,8 @@ class StrictStoreFeederStockExportFiles:
     stock_updates_ready_csv: Path
     stock_updates_ready_xlsx: Path
     quarantine_review: Path
+    supplier_setup_needed: Path
+    mapping_ready_but_supplier_missing: Path
     zero_stock_updates: Path
     missing_supplier_skus: Path
     skipped_not_in_supplier_mapping: Path
@@ -257,6 +259,8 @@ def write_strict_storefeeder_stock_export(
         stock_updates_ready_csv=out_dir / "storefeeder_stock_updates_ready.csv",
         stock_updates_ready_xlsx=out_dir / "storefeeder_stock_updates_ready.xlsx",
         quarantine_review=out_dir / "quarantine_review.csv",
+        supplier_setup_needed=out_dir / "supplier_setup_needed.csv",
+        mapping_ready_but_supplier_missing=out_dir / "mapping_ready_but_supplier_missing.csv",
         zero_stock_updates=out_dir / "zero_stock_updates.csv",
         missing_supplier_skus=out_dir / "missing_supplier_skus.csv",
         skipped_not_in_supplier_mapping=out_dir / "skipped_not_in_supplier_mapping.csv",
@@ -277,6 +281,8 @@ def write_strict_storefeeder_stock_export(
         result.api_payload_preview.to_csv(files.api_payload_preview, index=False)
 
     result.quarantine_review.to_csv(files.quarantine_review, index=False)
+    result.supplier_setup_needed.to_csv(files.supplier_setup_needed, index=False)
+    result.mapping_ready_but_supplier_missing.to_csv(files.mapping_ready_but_supplier_missing, index=False)
     result.zero_stock_updates.to_csv(files.zero_stock_updates, index=False)
     result.missing_supplier_skus.to_csv(files.missing_supplier_skus, index=False)
     result.skipped_not_in_supplier_mapping.to_csv(files.skipped_not_in_supplier_mapping, index=False)

@@ -38,3 +38,8 @@ utils/_state/
 
 reports/amazon/
 data/amazon_export_raw.txt
+reports/
+backups/
+*.backup_*
+__pycache__/
+*.pyc
