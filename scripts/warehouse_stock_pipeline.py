@@ -158,26 +158,43 @@ def main() -> int:
         expected_qty = parse_int(row["physical_stock"])
         product = detail_by_sku.get(sku_key)
         found_location = {}
+        readback_status = "missing_product"
+        location_check_status = "not_checked"
+        quantity_check_status = "not_checked"
         if not product:
             blockers.append({"stage": "manifest", "SKU": sku, "reason": "manifest_sku_missing_from_storefeeder"})
         else:
+            readback_status = "ok"
+            locations = product["locations"]
             matches = [
                 location
-                for location in product["locations"]
+                for location in locations
                 if location["stock_location"].casefold() == args.stock_location.casefold()
             ]
             if not matches:
-                blockers.append({"stage": "manifest", "SKU": sku, "reason": "missing_expected_warehouse_stock_location"})
+                if locations:
+                    location_check_status = "definitely_absent"
+                    blockers.append({"stage": "manifest", "SKU": sku, "reason": "missing_expected_warehouse_stock_location"})
+                else:
+                    location_check_status = "unknown_no_stock_locations_exposed"
             else:
                 found_location = matches[0]
+                location_check_status = "present"
                 available = parse_int(found_location.get("available"))
                 physical = parse_int(found_location.get("physical_stock"))
                 if expected_qty is None:
+                    quantity_check_status = "invalid_manifest_quantity"
                     blockers.append({"stage": "manifest", "SKU": sku, "reason": "invalid_manifest_physical_stock"})
                 elif physical is not None and physical != expected_qty:
+                    quantity_check_status = "physical_stock_mismatch"
                     blockers.append({"stage": "manifest", "SKU": sku, "reason": "physical_stock_mismatch"})
                 elif available is not None and available != expected_qty:
+                    quantity_check_status = "available_stock_mismatch"
                     blockers.append({"stage": "manifest", "SKU": sku, "reason": "available_stock_mismatch"})
+                elif physical is None and available is None:
+                    quantity_check_status = "unknown_no_quantity_exposed"
+                else:
+                    quantity_check_status = "matches"
 
         in_supplier_sync = sku_key in target_skus
         if in_supplier_sync:
@@ -198,6 +215,9 @@ def main() -> int:
                 "found_stock_location": found_location.get("stock_location", ""),
                 "api_available": found_location.get("available", ""),
                 "api_physical_stock": found_location.get("physical_stock", ""),
+                "readback_status": readback_status,
+                "location_check_status": location_check_status,
+                "quantity_check_status": quantity_check_status,
                 "enabled_for_same_day": row["enabled_for_same_day"],
                 "notes": row["notes"],
             }
@@ -215,6 +235,9 @@ def main() -> int:
                     "found_stock_location": "",
                     "api_available": "",
                     "api_physical_stock": "",
+                    "readback_status": "not_same_day_manifest_row",
+                    "location_check_status": "not_checked",
+                    "quantity_check_status": "not_checked",
                     "enabled_for_same_day": "no",
                     "notes": "same-prefix non-manifest variant; not enabled",
                 }
@@ -234,6 +257,8 @@ def main() -> int:
             {"metric": "manifest_rows", "value": len(manifest)},
             {"metric": "storefeeder_prefix_rows", "value": len(scan_df)},
             {"metric": "supplier_sync_exclusion_violations", "value": int(exclusion_df["in_supplier_sync_targets"].eq("yes").sum()) if not exclusion_df.empty else 0},
+            {"metric": "unknown_location_readbacks", "value": int(verification_df["location_check_status"].eq("unknown_no_stock_locations_exposed").sum()) if not verification_df.empty else 0},
+            {"metric": "unknown_quantity_readbacks", "value": int(verification_df["quantity_check_status"].eq("unknown_no_quantity_exposed").sum()) if not verification_df.empty else 0},
             {"metric": "blockers", "value": len(blocker_df)},
             {"metric": "verify_passed", "value": "yes" if blocker_df.empty else "no"},
         ]
@@ -246,6 +271,8 @@ def main() -> int:
         f"VERIFY_PASSED: {'yes' if blocker_df.empty else 'no'}",
         f"MANIFEST_ROWS: {len(manifest)}",
         f"STOREFEEDER_PREFIX_ROWS: {len(scan_df)}",
+        f"UNKNOWN_LOCATION_READBACKS: {int(verification_df['location_check_status'].eq('unknown_no_stock_locations_exposed').sum()) if not verification_df.empty else 0}",
+        f"UNKNOWN_QUANTITY_READBACKS: {int(verification_df['quantity_check_status'].eq('unknown_no_quantity_exposed').sum()) if not verification_df.empty else 0}",
         f"BLOCKERS: {len(blocker_df)}",
         f"OUT_DIR: {out_dir}",
         "",

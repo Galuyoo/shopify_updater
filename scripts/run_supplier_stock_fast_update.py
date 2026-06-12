@@ -44,6 +44,7 @@ OPTIONAL_TARGET_COLUMNS = [
     "preserve_existing_locations",
     "warehouse_safe_mode",
     "skip_stock_location_update",
+    "allow_stock_location_update",
 ]
 
 PAYLOAD_COLUMNS = [
@@ -80,6 +81,7 @@ STOCK_LOCATION_PAYLOAD_COLUMNS = [
 
 STOCK_LOCATION_MAX_RETRIES = 2
 STOCK_LOCATION_RETRY_DELAY_SECONDS = 5
+CHANNEL_SAFETY_SKIP_COLUMNS = ["ProductID", "SKU", "SupplierSKU", "supplier", "stock_location", "skip_reason"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,7 +131,7 @@ def main() -> int:
     ralawise_stock = read_csv(args.ralawise_stock)
     uneek_stock = read_csv(args.uneek_stock)
     supplier_stock = build_supplier_stock_lookup(ralawise_stock, uneek_stock)
-    preview, stock_location_preview, invalid_rows = build_fast_payload_preview(
+    preview, stock_location_preview, invalid_rows, channel_safety_skips = build_fast_payload_preview(
         targets,
         supplier_stock,
         buffer=args.buffer,
@@ -142,17 +144,22 @@ def main() -> int:
         stock_location_preview = stock_location_preview[
             stock_location_preview.apply(lambda row: (str(row["SKU"]), str(row["supplier_sku"])) in limited_keys, axis=1)
         ].copy()
+        channel_safety_skips = channel_safety_skips[
+            channel_safety_skips.apply(lambda row: (str(row["SKU"]), str(row["SupplierSKU"])) in limited_keys, axis=1)
+        ].copy()
 
     paths = {
         "fast_stock_payload_preview": out_dir / "fast_stock_payload_preview.csv",
         "fast_stock_location_payload_preview": out_dir / "fast_stock_location_payload_preview.csv",
         "fast_stock_summary": out_dir / "fast_stock_summary.csv",
         "fast_stock_invalid_rows": out_dir / "fast_stock_invalid_rows.csv",
+        "fast_stock_channel_safety_skips": out_dir / "fast_stock_channel_safety_skips.csv",
     }
     preview.to_csv(paths["fast_stock_payload_preview"], index=False)
     stock_location_preview.to_csv(paths["fast_stock_location_payload_preview"], index=False)
     invalid_rows.to_csv(paths["fast_stock_invalid_rows"], index=False)
-    summary = _summary_frame(targets, preview, stock_location_preview, invalid_rows, args.live_stock_update)
+    channel_safety_skips.to_csv(paths["fast_stock_channel_safety_skips"], index=False)
+    summary = _summary_frame(targets, preview, stock_location_preview, invalid_rows, args.live_stock_update, channel_safety_skips=channel_safety_skips)
     summary.to_csv(paths["fast_stock_summary"], index=False)
 
     print("Fast StoreFeeder stock update dry run" if not args.live_stock_update else "Fast StoreFeeder stock update live run")
@@ -189,6 +196,7 @@ def main() -> int:
         stock_location_update_success=_csv_count(location_live_paths["fast_stock_location_update_success"]),
         stock_location_update_failures=stock_location_update_failures,
         retry_count=stock_location_retry_count,
+        channel_safety_skips=channel_safety_skips,
     )
     summary.to_csv(paths["fast_stock_summary"], index=False)
     print("\nLive stock update reports:")
@@ -210,11 +218,16 @@ def build_fast_payload_preview(
     buffer: int,
     max_stock: int,
     missing_as_zero: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _require_columns(targets, TARGET_COLUMNS, "target file")
     if targets.empty:
         invalid = pd.DataFrame([{"invalid_reason": "target_file_empty"}])
-        return pd.DataFrame(columns=PAYLOAD_COLUMNS), pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS), invalid
+        return (
+            pd.DataFrame(columns=PAYLOAD_COLUMNS),
+            pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS),
+            invalid,
+            pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS),
+        )
 
     rows = targets[TARGET_COLUMNS + [column for column in OPTIONAL_TARGET_COLUMNS if column in targets.columns]].copy()
     for column in TARGET_COLUMNS + [column for column in OPTIONAL_TARGET_COLUMNS if column in rows.columns]:
@@ -229,6 +242,10 @@ def build_fast_payload_preview(
         rows["preserve_existing_locations"] = "no"
     if "warehouse_safe_mode" not in rows.columns:
         rows["warehouse_safe_mode"] = "no"
+    if "skip_stock_location_update" not in rows.columns:
+        rows["skip_stock_location_update"] = "no"
+    if "allow_stock_location_update" not in rows.columns:
+        rows["allow_stock_location_update"] = "no"
 
     preserve_mask = (
         rows["preserve_existing_locations"].str.casefold().isin(["yes", "true", "1", "y"])
@@ -269,7 +286,42 @@ def build_fast_payload_preview(
     invalid_rows = rows[rows["invalid_reason"].ne("")].copy()
     valid = rows[rows["invalid_reason"].eq("")].copy()
     if valid.empty:
-        return pd.DataFrame(columns=PAYLOAD_COLUMNS), pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS), invalid_rows.reset_index(drop=True)
+        return (
+            pd.DataFrame(columns=PAYLOAD_COLUMNS),
+            pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS),
+            invalid_rows.reset_index(drop=True),
+            pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS),
+        )
+
+    valid["_channel_decorated"] = valid["SKU"].astype(str).str.strip().str.casefold().ne(
+        valid["SupplierSKU"].astype(str).str.strip().str.casefold()
+    )
+    valid["_allow_stock_location_update"] = valid["allow_stock_location_update"].astype(str).str.strip().str.casefold().isin(["yes", "true", "1", "y"])
+    valid["_explicit_skip_stock_location_update"] = valid["skip_stock_location_update"].astype(str).str.strip().str.casefold().isin(["yes", "true", "1", "y"])
+    valid["_stock_location_skip_reason"] = ""
+    valid.loc[valid["_explicit_skip_stock_location_update"], "_stock_location_skip_reason"] = "explicit_skip_stock_location_update"
+    implicit_channel_skip = (
+        valid["_channel_decorated"]
+        & ~valid["_allow_stock_location_update"]
+        & valid["_stock_location_skip_reason"].eq("")
+    )
+    valid.loc[implicit_channel_skip, "_stock_location_skip_reason"] = "implicit_channel_decorated_stock_location_skip"
+
+    channel_safety_skips = valid[valid["_stock_location_skip_reason"].ne("")].copy()
+    if channel_safety_skips.empty:
+        channel_safety_skip_report = pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
+    else:
+        channel_safety_skip_report = pd.DataFrame(
+            {
+                "ProductID": channel_safety_skips["ProductID"],
+                "SKU": channel_safety_skips["SKU"],
+                "SupplierSKU": channel_safety_skips["SupplierSKU"],
+                "supplier": channel_safety_skips["supplier"],
+                "stock_location": channel_safety_skips["stock_location"],
+                "skip_reason": channel_safety_skips["_stock_location_skip_reason"],
+            },
+            columns=CHANNEL_SAFETY_SKIP_COLUMNS,
+        )
 
     preview = pd.DataFrame(
         {
@@ -290,7 +342,12 @@ def build_fast_payload_preview(
         columns=PAYLOAD_COLUMNS,
     )
     stock_location_preview = _stock_location_payload_preview(valid)
-    return preview.reset_index(drop=True), stock_location_preview.reset_index(drop=True), invalid_rows.reset_index(drop=True)
+    return (
+        preview.reset_index(drop=True),
+        stock_location_preview.reset_index(drop=True),
+        invalid_rows.reset_index(drop=True),
+        channel_safety_skip_report.reset_index(drop=True),
+    )
 
 
 def _default_clear_stock_locations(supplier: str) -> str:
@@ -310,8 +367,7 @@ def _stock_location_payload_preview(valid: pd.DataFrame) -> pd.DataFrame:
         supplier_sku = str(row["SupplierSKU"]).strip()
         target_location = str(row["inventory_stock_location"]).strip()
         quantity = int(row["quantity"])
-        skip_location_update = str(row.get("skip_stock_location_update", "")).strip().casefold() in ["yes", "true", "1", "y"]
-        if skip_location_update:
+        if str(row.get("_stock_location_skip_reason", "")).strip():
             continue
         if target_location:
             rows.append(_stock_location_payload_row(sku, supplier, supplier_sku, target_location, quantity))
@@ -496,7 +552,9 @@ def _summary_frame(
     stock_location_update_success: int = 0,
     stock_location_update_failures: int = 0,
     retry_count: int = 0,
+    channel_safety_skips: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    channel_safety_skips = channel_safety_skips if channel_safety_skips is not None else pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
     return pd.DataFrame(
         [
             {"metric": "dry_run", "value": "no" if live else "yes"},
@@ -504,6 +562,12 @@ def _summary_frame(
             {"metric": "supplier_payload_rows", "value": len(preview)},
             {"metric": "stock_location_payload_rows", "value": len(stock_location_preview)},
             {"metric": "invalid_rows", "value": len(invalid_rows)},
+            {"metric": "channel_decorated_rows", "value": _channel_decorated_count(targets)},
+            {
+                "metric": "implicit_channel_stock_location_skips",
+                "value": _skip_reason_count(channel_safety_skips, "implicit_channel_decorated_stock_location_skip"),
+            },
+            {"metric": "explicit_stock_location_allowed_rows", "value": _explicit_stock_location_allowed_count(targets)},
             {"metric": "supplier_update_success", "value": supplier_update_success},
             {"metric": "supplier_update_failures", "value": supplier_update_failures},
             {"metric": "stock_location_update_success", "value": stock_location_update_success},
@@ -518,6 +582,32 @@ def _require_columns(df: pd.DataFrame, columns: list[str], label: str) -> None:
     missing = [column for column in columns if column not in df.columns]
     if missing:
         raise ValueError(f"{label} missing required columns: " + ", ".join(missing))
+
+
+def _channel_decorated_count(targets: pd.DataFrame) -> int:
+    if "SKU" not in targets.columns or "SupplierSKU" not in targets.columns:
+        return 0
+    return int(
+        targets["SKU"].fillna("").astype(str).str.strip().str.casefold().ne(
+            targets["SupplierSKU"].fillna("").astype(str).str.strip().str.casefold()
+        ).sum()
+    )
+
+
+def _explicit_stock_location_allowed_count(targets: pd.DataFrame) -> int:
+    if "SKU" not in targets.columns or "SupplierSKU" not in targets.columns or "allow_stock_location_update" not in targets.columns:
+        return 0
+    decorated = targets["SKU"].fillna("").astype(str).str.strip().str.casefold().ne(
+        targets["SupplierSKU"].fillna("").astype(str).str.strip().str.casefold()
+    )
+    allowed = targets["allow_stock_location_update"].fillna("").astype(str).str.strip().str.casefold().isin(["yes", "true", "1", "y"])
+    return int((decorated & allowed).sum())
+
+
+def _skip_reason_count(channel_safety_skips: pd.DataFrame, reason: str) -> int:
+    if channel_safety_skips.empty or "skip_reason" not in channel_safety_skips.columns:
+        return 0
+    return int(channel_safety_skips["skip_reason"].astype(str).eq(reason).sum())
 
 
 def _append_reason(existing: str, reason: str) -> str:
