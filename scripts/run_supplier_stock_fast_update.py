@@ -46,6 +46,7 @@ OPTIONAL_TARGET_COLUMNS = [
     "skip_stock_location_update",
     "allow_stock_location_update",
     "stock_strategy",
+    "sellable_stock_location",
 ]
 
 PAYLOAD_COLUMNS = [
@@ -315,6 +316,12 @@ def build_fast_payload_preview(
         rows["allow_stock_location_update"] = "no"
     if "stock_strategy" not in rows.columns:
         rows["stock_strategy"] = ""
+    if "sellable_stock_location" not in rows.columns:
+        rows["sellable_stock_location"] = ""
+    supplier_synced_mask = rows["stock_strategy"].str.casefold().eq("supplier_synced_inventory")
+    sellable_mask = supplier_synced_mask & rows["sellable_stock_location"].str.strip().ne("")
+    rows.loc[sellable_mask, "inventory_stock_location"] = rows.loc[sellable_mask, "sellable_stock_location"]
+    rows.loc[~supplier_synced_mask, "sellable_stock_location"] = ""
 
     preserve_mask = (
         rows["preserve_existing_locations"].str.casefold().isin(["yes", "true", "1", "y"])
@@ -371,6 +378,8 @@ def build_fast_payload_preview(
     valid["_explicit_skip_stock_location_update"] = valid["skip_stock_location_update"].astype(str).str.strip().str.casefold().isin(["yes", "true", "1", "y"])
     valid["_stock_location_skip_reason"] = ""
     valid.loc[valid["_explicit_skip_stock_location_update"], "_stock_location_skip_reason"] = "explicit_skip_stock_location_update"
+    warehouse_only_mask = valid["stock_strategy"].astype(str).str.strip().str.casefold().eq("warehouse_only")
+    valid.loc[warehouse_only_mask & valid["_stock_location_skip_reason"].eq(""), "_stock_location_skip_reason"] = "warehouse_only_stock_location_protected"
     implicit_channel_skip = (
         valid["_channel_decorated"]
         & ~valid["_allow_stock_location_update"]
