@@ -45,6 +45,7 @@ OPTIONAL_TARGET_COLUMNS = [
     "warehouse_safe_mode",
     "skip_stock_location_update",
     "allow_stock_location_update",
+    "stock_strategy",
 ]
 
 PAYLOAD_COLUMNS = [
@@ -82,6 +83,26 @@ STOCK_LOCATION_PAYLOAD_COLUMNS = [
 STOCK_LOCATION_MAX_RETRIES = 2
 STOCK_LOCATION_RETRY_DELAY_SECONDS = 5
 CHANNEL_SAFETY_SKIP_COLUMNS = ["ProductID", "SKU", "SupplierSKU", "supplier", "stock_location", "skip_reason"]
+ZERO_LOCATION_PREVIEW_COLUMNS = [
+    "SKU",
+    "ProductID",
+    "stock_strategy",
+    "keep_stock_location",
+    "zero_stock_location",
+    "current_quantity",
+    "new_quantity",
+    "reason",
+]
+ZERO_LOCATION_SAFETY_SKIP_COLUMNS = [
+    "SKU",
+    "ProductID",
+    "stock_strategy",
+    "keep_stock_location",
+    "zero_stock_location",
+    "skip_reason",
+]
+KNOWN_STOCK_LOCATIONS = ["Ralawise", "Uneek", "Temporary stock location", "Unspecified", "Warehouse Stock"]
+UNSUPPORTED_ZERO_STOCK_LOCATIONS = ["Temporary stock location"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +119,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storefeeder-api-base-url", default="https://rest.storefeeder.com")
     parser.add_argument("--missing-as-zero", action="store_true", help="Explicitly allow missing supplier stock to become zero")
     parser.add_argument("--skip-stock-refresh", action="store_true")
+    parser.add_argument(
+        "--zero-other-locations-for-supplier-synced",
+        action="store_true",
+        help="For supplier_synced_inventory targets with explicit location permission, zero non-authoritative stock locations.",
+    )
     args = parser.parse_args()
     if args.api_limit is not None and args.api_limit < 0:
         parser.error("--api-limit must be zero or greater")
@@ -131,12 +157,20 @@ def main() -> int:
     ralawise_stock = read_csv(args.ralawise_stock)
     uneek_stock = read_csv(args.uneek_stock)
     supplier_stock = build_supplier_stock_lookup(ralawise_stock, uneek_stock)
-    preview, stock_location_preview, invalid_rows, channel_safety_skips = build_fast_payload_preview(
+    (
+        preview,
+        stock_location_preview,
+        zero_location_preview,
+        invalid_rows,
+        channel_safety_skips,
+        zero_location_safety_skips,
+    ) = build_fast_payload_preview(
         targets,
         supplier_stock,
         buffer=args.buffer,
         max_stock=args.max_stock,
         missing_as_zero=args.missing_as_zero,
+        zero_other_locations_for_supplier_synced=args.zero_other_locations_for_supplier_synced,
     )
     if args.api_limit is not None:
         preview = preview.head(args.api_limit).copy()
@@ -144,22 +178,38 @@ def main() -> int:
         stock_location_preview = stock_location_preview[
             stock_location_preview.apply(lambda row: (str(row["SKU"]), str(row["supplier_sku"])) in limited_keys, axis=1)
         ].copy()
+        limited_skus = set(preview["SKU"].astype(str))
+        zero_location_preview = zero_location_preview[zero_location_preview["SKU"].astype(str).isin(limited_skus)].copy()
         channel_safety_skips = channel_safety_skips[
             channel_safety_skips.apply(lambda row: (str(row["SKU"]), str(row["SupplierSKU"])) in limited_keys, axis=1)
         ].copy()
+        zero_location_safety_skips = zero_location_safety_skips[zero_location_safety_skips["SKU"].astype(str).isin(set(preview["SKU"].astype(str)))].copy()
 
     paths = {
         "fast_stock_payload_preview": out_dir / "fast_stock_payload_preview.csv",
         "fast_stock_location_payload_preview": out_dir / "fast_stock_location_payload_preview.csv",
+        "fast_stock_location_zero_payload_preview": out_dir / "fast_stock_location_zero_payload_preview.csv",
+        "fast_stock_location_zero_safety_skips": out_dir / "fast_stock_location_zero_safety_skips.csv",
         "fast_stock_summary": out_dir / "fast_stock_summary.csv",
         "fast_stock_invalid_rows": out_dir / "fast_stock_invalid_rows.csv",
         "fast_stock_channel_safety_skips": out_dir / "fast_stock_channel_safety_skips.csv",
     }
     preview.to_csv(paths["fast_stock_payload_preview"], index=False)
     stock_location_preview.to_csv(paths["fast_stock_location_payload_preview"], index=False)
+    zero_location_preview.to_csv(paths["fast_stock_location_zero_payload_preview"], index=False)
+    zero_location_safety_skips.to_csv(paths["fast_stock_location_zero_safety_skips"], index=False)
     invalid_rows.to_csv(paths["fast_stock_invalid_rows"], index=False)
     channel_safety_skips.to_csv(paths["fast_stock_channel_safety_skips"], index=False)
-    summary = _summary_frame(targets, preview, stock_location_preview, invalid_rows, args.live_stock_update, channel_safety_skips=channel_safety_skips)
+    summary = _summary_frame(
+        targets,
+        preview,
+        stock_location_preview,
+        invalid_rows,
+        args.live_stock_update,
+        channel_safety_skips=channel_safety_skips,
+        zero_location_preview=zero_location_preview,
+        zero_location_safety_skips=zero_location_safety_skips,
+    )
     summary.to_csv(paths["fast_stock_summary"], index=False)
 
     print("Fast StoreFeeder stock update dry run" if not args.live_stock_update else "Fast StoreFeeder stock update live run")
@@ -180,11 +230,20 @@ def main() -> int:
     batches = batch_items(items, args.api_batch_size)
     stock_location_items = payload_preview_to_storefeeder_items(stock_location_preview)
     stock_location_batches = batch_items(stock_location_items, args.api_batch_size)
+    zero_location_items = payload_preview_to_storefeeder_items(_zero_preview_to_stock_location_payload(zero_location_preview))
+    zero_location_batches = batch_items(zero_location_items, args.api_batch_size)
     client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
     live_paths = _send_fast_stock_batches(client, batches, out_dir)
     location_live_paths, stock_location_retry_count = _send_fast_stock_location_batches(client, stock_location_batches, out_dir)
+    zero_location_live_paths, zero_location_retry_count = _send_fast_stock_location_batches(
+        client,
+        zero_location_batches,
+        out_dir,
+        file_prefix="fast_stock_location_zero_update",
+    )
     supplier_update_failures = _csv_count(live_paths["fast_stock_update_failures"])
     stock_location_update_failures = _csv_count(location_live_paths["fast_stock_location_update_failures"])
+    zero_location_update_failures = _csv_count(zero_location_live_paths["fast_stock_location_zero_update_failures"])
     summary = _summary_frame(
         targets,
         preview,
@@ -195,18 +254,23 @@ def main() -> int:
         supplier_update_failures=supplier_update_failures,
         stock_location_update_success=_csv_count(location_live_paths["fast_stock_location_update_success"]),
         stock_location_update_failures=stock_location_update_failures,
-        retry_count=stock_location_retry_count,
+        retry_count=stock_location_retry_count + zero_location_retry_count,
         channel_safety_skips=channel_safety_skips,
+        zero_location_preview=zero_location_preview,
+        zero_location_safety_skips=zero_location_safety_skips,
+        zero_other_locations_success=_csv_count(zero_location_live_paths["fast_stock_location_zero_update_success"]),
+        zero_other_locations_failures=zero_location_update_failures,
     )
     summary.to_csv(paths["fast_stock_summary"], index=False)
     print("\nLive stock update reports:")
-    for path in [*live_paths.values(), *location_live_paths.values()]:
+    for path in [*live_paths.values(), *location_live_paths.values(), *zero_location_live_paths.values()]:
         print(path)
-    if supplier_update_failures or stock_location_update_failures:
+    if supplier_update_failures or stock_location_update_failures or zero_location_update_failures:
         raise SystemExit(
             "Fast stock update completed with failures: "
             f"supplier_update_failures={supplier_update_failures}, "
-            f"stock_location_update_failures={stock_location_update_failures}"
+            f"stock_location_update_failures={stock_location_update_failures}, "
+            f"zero_other_locations_failures={zero_location_update_failures}"
         )
     return 0
 
@@ -218,15 +282,18 @@ def build_fast_payload_preview(
     buffer: int,
     max_stock: int,
     missing_as_zero: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    zero_other_locations_for_supplier_synced: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _require_columns(targets, TARGET_COLUMNS, "target file")
     if targets.empty:
         invalid = pd.DataFrame([{"invalid_reason": "target_file_empty"}])
         return (
             pd.DataFrame(columns=PAYLOAD_COLUMNS),
             pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS),
+            pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS),
             invalid,
             pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS),
+            pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS),
         )
 
     rows = targets[TARGET_COLUMNS + [column for column in OPTIONAL_TARGET_COLUMNS if column in targets.columns]].copy()
@@ -246,6 +313,8 @@ def build_fast_payload_preview(
         rows["skip_stock_location_update"] = "no"
     if "allow_stock_location_update" not in rows.columns:
         rows["allow_stock_location_update"] = "no"
+    if "stock_strategy" not in rows.columns:
+        rows["stock_strategy"] = ""
 
     preserve_mask = (
         rows["preserve_existing_locations"].str.casefold().isin(["yes", "true", "1", "y"])
@@ -289,8 +358,10 @@ def build_fast_payload_preview(
         return (
             pd.DataFrame(columns=PAYLOAD_COLUMNS),
             pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS),
+            pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS),
             invalid_rows.reset_index(drop=True),
             pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS),
+            pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS),
         )
 
     valid["_channel_decorated"] = valid["SKU"].astype(str).str.strip().str.casefold().ne(
@@ -342,11 +413,18 @@ def build_fast_payload_preview(
         columns=PAYLOAD_COLUMNS,
     )
     stock_location_preview = _stock_location_payload_preview(valid)
+    if zero_other_locations_for_supplier_synced:
+        zero_location_preview, zero_location_safety_skips = _zero_other_locations_preview(valid)
+    else:
+        zero_location_preview = pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
+        zero_location_safety_skips = pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
     return (
         preview.reset_index(drop=True),
         stock_location_preview.reset_index(drop=True),
+        zero_location_preview.reset_index(drop=True),
         invalid_rows.reset_index(drop=True),
         channel_safety_skip_report.reset_index(drop=True),
+        zero_location_safety_skips.reset_index(drop=True),
     )
 
 
@@ -394,6 +472,114 @@ def _stock_location_payload_row(sku: str, supplier: str, supplier_sku: str, stoc
         "StockLocationID.Value": stock_location,
         "Reason": "Supplier stock sync",
     }
+
+
+def _zero_other_locations_preview(valid: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    zero_rows: list[dict[str, Any]] = []
+    skip_rows: list[dict[str, Any]] = []
+    for _, row in valid.iterrows():
+        sku = str(row.get("SKU", "")).strip()
+        product_id = str(row.get("ProductID", "")).strip()
+        strategy = str(row.get("stock_strategy", "")).strip().casefold()
+        keep_location = str(row.get("inventory_stock_location", "")).strip() or str(row.get("stock_location", "")).strip()
+        allow_location_update = bool(row.get("_allow_stock_location_update", False))
+        explicit_skip = bool(row.get("_explicit_skip_stock_location_update", False))
+
+        if strategy == "warehouse_only":
+            continue
+        if strategy != "supplier_synced_inventory":
+            skip_rows.append(_zero_location_skip_row(row, keep_location, "ambiguous_or_missing_stock_strategy"))
+            continue
+        if not allow_location_update:
+            skip_rows.append(_zero_location_skip_row(row, keep_location, "allow_stock_location_update_not_enabled"))
+            continue
+        if explicit_skip or str(row.get("_stock_location_skip_reason", "")).strip():
+            skip_rows.append(_zero_location_skip_row(row, keep_location, "stock_location_update_is_skipped"))
+            continue
+        if not keep_location:
+            skip_rows.append(_zero_location_skip_row(row, keep_location, "missing_authoritative_stock_location"))
+            continue
+
+        zero_locations = _zero_candidate_locations(row, keep_location)
+        for zero_location in zero_locations:
+            if zero_location.casefold() == keep_location.casefold():
+                continue
+            if _contains_casefold(UNSUPPORTED_ZERO_STOCK_LOCATIONS, zero_location):
+                skip_rows.append(
+                    _zero_location_skip_row(
+                        row,
+                        keep_location,
+                        "unsupported_or_inaccessible_stock_location",
+                        zero_location,
+                    )
+                )
+                continue
+            if zero_location.casefold() == "warehouse stock" and strategy != "supplier_synced_inventory":
+                skip_rows.append(_zero_location_skip_row(row, keep_location, "warehouse_stock_zero_not_unambiguously_supplier_synced", zero_location))
+                continue
+            zero_rows.append(
+                {
+                    "SKU": sku,
+                    "ProductID": product_id,
+                    "stock_strategy": "supplier_synced_inventory",
+                    "keep_stock_location": keep_location,
+                    "zero_stock_location": zero_location,
+                    "current_quantity": "",
+                    "new_quantity": 0,
+                    "reason": "supplier_synced_inventory_authoritative_zero_other_locations",
+                }
+            )
+    return (
+        pd.DataFrame(zero_rows, columns=ZERO_LOCATION_PREVIEW_COLUMNS),
+        pd.DataFrame(skip_rows, columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS),
+    )
+
+
+def _zero_candidate_locations(row: pd.Series, keep_location: str) -> list[str]:
+    candidates: list[str] = []
+    for value in [row.get("clear_stock_locations", ""), "|".join(KNOWN_STOCK_LOCATIONS)]:
+        for location in _pipe_values(value):
+            if location and location.casefold() != keep_location.casefold() and not _contains_casefold(candidates, location):
+                candidates.append(location)
+    return candidates
+
+
+def _contains_casefold(values: list[str], value: str) -> bool:
+    return any(existing.casefold() == value.casefold() for existing in values)
+
+
+def _zero_location_skip_row(row: pd.Series, keep_location: str, reason: str, zero_location: str = "") -> dict[str, Any]:
+    return {
+        "SKU": str(row.get("SKU", "")).strip(),
+        "ProductID": str(row.get("ProductID", "")).strip(),
+        "stock_strategy": str(row.get("stock_strategy", "")).strip(),
+        "keep_stock_location": keep_location,
+        "zero_stock_location": zero_location,
+        "skip_reason": reason,
+    }
+
+
+def _zero_preview_to_stock_location_payload(zero_preview: pd.DataFrame) -> pd.DataFrame:
+    if zero_preview.empty:
+        return pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS)
+    rows = pd.DataFrame(
+        {
+            "SKU": zero_preview["SKU"],
+            "supplier": "",
+            "supplier_sku": "",
+            "stock_location": zero_preview["zero_stock_location"],
+            "quantity": zero_preview["new_quantity"].astype(int),
+            "confidence_status": "update_ready",
+            "ProductIDType.IDType": "SKU",
+            "ProductIDType.Value": zero_preview["SKU"],
+            "AdjustmentType": "AbsoluteAdjustment",
+            "AdjustmentAmount": zero_preview["new_quantity"].astype(int),
+            "StockLocationID.IDType": "StockLocationReference",
+            "StockLocationID.Value": zero_preview["zero_stock_location"],
+            "Reason": "Supplier-synced inventory authoritative zero other locations",
+        }
+    )
+    return rows[STOCK_LOCATION_PAYLOAD_COLUMNS]
 
 
 def _pipe_values(value: Any) -> list[str]:
@@ -452,12 +638,18 @@ def _send_fast_stock_batches(client: StoreFeederApiClient, batches: list[list[di
     return paths
 
 
-def _send_fast_stock_location_batches(client: StoreFeederApiClient, batches: list[list[dict[str, Any]]], out_dir: Path) -> tuple[dict[str, Path], int]:
+def _send_fast_stock_location_batches(
+    client: StoreFeederApiClient,
+    batches: list[list[dict[str, Any]]],
+    out_dir: Path,
+    *,
+    file_prefix: str = "fast_stock_location_update",
+) -> tuple[dict[str, Path], int]:
     paths = {
-        "fast_stock_location_update_success": out_dir / "fast_stock_location_update_success.csv",
-        "fast_stock_location_update_failures": out_dir / "fast_stock_location_update_failures.csv",
-        "fast_stock_location_update_batches": out_dir / "fast_stock_location_update_batches.csv",
-        "fast_stock_location_update_raw_responses": out_dir / "fast_stock_location_update_raw_responses.json",
+        f"{file_prefix}_success": out_dir / f"{file_prefix}_success.csv",
+        f"{file_prefix}_failures": out_dir / f"{file_prefix}_failures.csv",
+        f"{file_prefix}_batches": out_dir / f"{file_prefix}_batches.csv",
+        f"{file_prefix}_raw_responses": out_dir / f"{file_prefix}_raw_responses.json",
     }
     success_rows = []
     failure_rows = []
@@ -472,6 +664,8 @@ def _send_fast_stock_location_batches(client: StoreFeederApiClient, batches: lis
         "stock_location_id_value",
         "adjustment_type",
         "adjustment_amount",
+        "success",
+        "error",
     ]
     for batch_number, batch in enumerate(batches, start=1):
         attempt = 0
@@ -504,14 +698,19 @@ def _send_fast_stock_location_batches(client: StoreFeederApiClient, batches: lis
             attempt += 1
             time.sleep(STOCK_LOCATION_RETRY_DELAY_SECONDS)
 
-        target_rows = failure_rows if result.status_code >= 400 or result.failed else success_rows
-        for item in batch:
-            target_rows.append(_stock_location_item_report_row(batch_number, item, result.status_code))
+        _append_stock_location_response_rows(
+            success_rows,
+            failure_rows,
+            batch_number,
+            batch,
+            result.status_code,
+            result.response_json,
+        )
 
-    pd.DataFrame(success_rows, columns=report_columns).to_csv(paths["fast_stock_location_update_success"], index=False)
-    pd.DataFrame(failure_rows, columns=report_columns).to_csv(paths["fast_stock_location_update_failures"], index=False)
-    pd.DataFrame(batch_rows).to_csv(paths["fast_stock_location_update_batches"], index=False)
-    paths["fast_stock_location_update_raw_responses"].write_text(json.dumps(raw_responses, indent=2), encoding="utf-8")
+    pd.DataFrame(success_rows, columns=report_columns).to_csv(paths[f"{file_prefix}_success"], index=False)
+    pd.DataFrame(failure_rows, columns=report_columns).to_csv(paths[f"{file_prefix}_failures"], index=False)
+    pd.DataFrame(batch_rows).to_csv(paths[f"{file_prefix}_batches"], index=False)
+    paths[f"{file_prefix}_raw_responses"].write_text(json.dumps(raw_responses, indent=2), encoding="utf-8")
     return paths, retry_count
 
 
@@ -528,7 +727,49 @@ def _supplier_item_report_row(batch_number: int, item: dict[str, Any], status_co
     }
 
 
-def _stock_location_item_report_row(batch_number: int, item: dict[str, Any], status_code: int) -> dict[str, Any]:
+def _append_stock_location_response_rows(
+    success_rows: list[dict[str, Any]],
+    failure_rows: list[dict[str, Any]],
+    batch_number: int,
+    batch: list[dict[str, Any]],
+    status_code: int,
+    response_json: dict[str, Any],
+) -> None:
+    responses = response_json.get("Responses")
+    if not isinstance(responses, list) or len(responses) != len(batch):
+        batch_success = status_code < 400 and not _response_failed(response_json)
+        target_rows = success_rows if batch_success else failure_rows
+        for item in batch:
+            target_rows.append(
+                _stock_location_item_report_row(
+                    batch_number,
+                    item,
+                    status_code,
+                    success=batch_success,
+                    error=_response_error(response_json) if not batch_success else "",
+                )
+            )
+        return
+
+    for item, item_response in zip(batch, responses):
+        if not isinstance(item_response, dict):
+            success = False
+            error = str(item_response)
+        else:
+            success = _truthy(item_response.get("Success"))
+            error = _response_error(item_response)
+        target_rows = success_rows if success else failure_rows
+        target_rows.append(_stock_location_item_report_row(batch_number, item, status_code, success=success, error=error))
+
+
+def _stock_location_item_report_row(
+    batch_number: int,
+    item: dict[str, Any],
+    status_code: int,
+    *,
+    success: bool,
+    error: str,
+) -> dict[str, Any]:
     return {
         "batch_number": batch_number,
         "status_code": status_code,
@@ -537,7 +778,30 @@ def _stock_location_item_report_row(batch_number: int, item: dict[str, Any], sta
         "stock_location_id_value": item["StockLocationID"]["Value"],
         "adjustment_type": item["AdjustmentType"],
         "adjustment_amount": item["AdjustmentAmount"],
+        "success": "yes" if success else "no",
+        "error": error,
     }
+
+
+def _response_failed(response_json: dict[str, Any]) -> bool:
+    try:
+        return int(response_json.get("Failed", 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _response_error(response_json: dict[str, Any]) -> str:
+    for key in ["Error", "Errors", "Message", "ExceptionMessage", "raw_text"]:
+        value = response_json.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in ["true", "1", "yes", "y", "success"]
 
 
 def _summary_frame(
@@ -553,14 +817,22 @@ def _summary_frame(
     stock_location_update_failures: int = 0,
     retry_count: int = 0,
     channel_safety_skips: pd.DataFrame | None = None,
+    zero_location_preview: pd.DataFrame | None = None,
+    zero_location_safety_skips: pd.DataFrame | None = None,
+    zero_other_locations_success: int = 0,
+    zero_other_locations_failures: int = 0,
 ) -> pd.DataFrame:
     channel_safety_skips = channel_safety_skips if channel_safety_skips is not None else pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
+    zero_location_preview = zero_location_preview if zero_location_preview is not None else pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
+    zero_location_safety_skips = zero_location_safety_skips if zero_location_safety_skips is not None else pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
     return pd.DataFrame(
         [
             {"metric": "dry_run", "value": "no" if live else "yes"},
             {"metric": "target_rows", "value": len(targets)},
             {"metric": "supplier_payload_rows", "value": len(preview)},
             {"metric": "stock_location_payload_rows", "value": len(stock_location_preview)},
+            {"metric": "zero_other_locations_payload_rows", "value": len(zero_location_preview)},
+            {"metric": "zero_other_locations_safety_skips", "value": len(zero_location_safety_skips)},
             {"metric": "invalid_rows", "value": len(invalid_rows)},
             {"metric": "channel_decorated_rows", "value": _channel_decorated_count(targets)},
             {
@@ -572,6 +844,8 @@ def _summary_frame(
             {"metric": "supplier_update_failures", "value": supplier_update_failures},
             {"metric": "stock_location_update_success", "value": stock_location_update_success},
             {"metric": "stock_location_update_failures", "value": stock_location_update_failures},
+            {"metric": "zero_other_locations_success", "value": zero_other_locations_success},
+            {"metric": "zero_other_locations_failures", "value": zero_other_locations_failures},
             {"metric": "retry_count", "value": retry_count},
             {"metric": "live_stock_update", "value": "yes" if live else "no"},
         ]

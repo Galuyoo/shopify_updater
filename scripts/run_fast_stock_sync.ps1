@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 Set-Location "C:\shopify_updater_amazon_work"
 
@@ -24,6 +24,7 @@ python scripts\run_supplier_stock_fast_update.py `
   --live-stock-update `
   --api-limit 2500 `
   --buffer 0 `
-  --max-stock 999999
+  --max-stock 999999 `
+  --zero-other-locations-for-supplier-synced
 
 exit $LASTEXITCODE
