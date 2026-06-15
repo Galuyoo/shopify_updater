@@ -19,7 +19,7 @@ $OutDir = "reports\scheduled_fast_stock_sync\$RunId"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 python scripts\run_supplier_stock_fast_update.py `
-  --targets data\storefeeder_supplier_stock_update_targets_active_clean.csv `
+  --targets data\storefeeder_supplier_stock_update_targets.csv `
   --out-dir $OutDir `
   --live-stock-update `
   --api-limit 2500
