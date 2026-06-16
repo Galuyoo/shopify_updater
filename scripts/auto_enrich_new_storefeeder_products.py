@@ -11,6 +11,7 @@ from typing import Dict, List, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 CORE = Path(__file__).with_name("_auto_enrich_new_storefeeder_products_core.py")
 TARGET = ROOT / "data" / "storefeeder_supplier_stock_update_targets.csv"
+DEFAULT_WAREHOUSE_ONLY_RULES = ROOT / "data" / "warehouse_only_prime_sku_rules.csv"
 
 
 def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -57,6 +58,46 @@ def _load_override_file(path: str | None, strategy: str) -> Dict[str, Dict[str, 
         }
 
     return overrides
+
+
+def _load_warehouse_only_rules() -> List[Dict[str, str]]:
+    _, rows = _read_csv(DEFAULT_WAREHOUSE_ONLY_RULES)
+    rules: List[Dict[str, str]] = []
+
+    for row in rows:
+        match_type = (row.get("match_type") or "").strip().casefold()
+        value = (row.get("value") or "").strip()
+        reason = (row.get("reason") or "").strip()
+
+        if match_type not in {"exact", "prefix"}:
+            continue
+        if not value:
+            continue
+
+        rules.append({
+            "match_type": match_type,
+            "value": value,
+            "reason": reason,
+        })
+
+    return rules
+
+
+def _match_warehouse_only_rule(sku: str, rules: List[Dict[str, str]]) -> Dict[str, str] | None:
+    sku_text = sku.strip()
+    sku_cf = sku_text.casefold()
+
+    for rule in rules:
+        value = rule["value"].strip()
+        value_cf = value.casefold()
+
+        if rule["match_type"] == "exact" and sku_cf == value_cf:
+            return rule
+
+        if rule["match_type"] == "prefix" and sku_cf.startswith(value_cf):
+            return rule
+
+    return None
 
 
 def _latest_report_dir(out_root: str | None) -> Path | None:
@@ -118,9 +159,6 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
     overrides = dict(supplier_overrides)
     overrides.update(warehouse_overrides)
 
-    if not overrides:
-        return
-
     report_dir = _latest_report_dir(args.out_root)
     if report_dir is None:
         raise RuntimeError("No auto-enrichment report directory found after core script run.")
@@ -129,6 +167,7 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
     quarantine_path = report_dir / "new_products_quarantine.csv"
     skipped_path = report_dir / "existing_products_skipped.csv"
     summary_path = report_dir / "enrichment_summary.csv"
+    protected_path = report_dir / "warehouse_only_protected_external.csv"
 
     ready_fields, ready_rows = _read_csv(ready_path)
     quarantine_fields, quarantine_rows = _read_csv(quarantine_path)
@@ -145,6 +184,12 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
         "SKU",
         "Parent SKU",
         "Name",
+        "Suppliers",
+        "Supplier SKUs",
+        "classification",
+        "quarantine_reason",
+        "override_source",
+        "override_reason",
         "SupplierSKU",
         "stock_strategy",
         "stock_location",
@@ -153,7 +198,6 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
         "warehouse_safe_mode",
         "skip_stock_location_update",
         "allow_stock_location_update",
-        "quarantine_reason",
         "reason",
         "classification_reason",
     ]
@@ -185,6 +229,12 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
             "SKU": sku,
             "Parent SKU": "",
             "Name": "Override SKU not found in StoreFeeder product scan",
+            "Suppliers": "",
+            "Supplier SKUs": "",
+            "classification": "",
+            "quarantine_reason": "override_sku_not_found_in_storefeeder_product_scan",
+            "override_source": "",
+            "override_reason": "",
             "SupplierSKU": "",
             "stock_strategy": strategy,
             "stock_location": "Warehouse Stock" if strategy == "warehouse_only" else "",
@@ -193,7 +243,6 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
             "warehouse_safe_mode": "yes" if strategy == "warehouse_only" else "",
             "skip_stock_location_update": "yes" if strategy == "warehouse_only" else "",
             "allow_stock_location_update": "no" if strategy == "warehouse_only" else "",
-            "quarantine_reason": "override_sku_not_found_in_storefeeder_product_scan",
             "reason": override.get("reason", ""),
             "classification_reason": "manual_override_not_seen_in_product_scan",
         })
@@ -201,15 +250,75 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
         quarantine_skus.add(sku)
         appended_missing += 1
 
-    _write_csv(quarantine_path, quarantine_fields, quarantine_rows)
+    rules = _load_warehouse_only_rules()
+
+    protected_fields = [
+        "ProductID",
+        "SKU",
+        "Parent SKU",
+        "Name",
+        "Suppliers",
+        "Supplier SKUs",
+        "match_type",
+        "rule_value",
+        "rule_reason",
+        "stock_strategy",
+        "stock_location",
+        "sellable_stock_location",
+        "preserve_existing_locations",
+        "warehouse_safe_mode",
+        "skip_stock_location_update",
+        "allow_stock_location_update",
+        "target_action",
+        "protected_reason",
+        "source_report_reason",
+    ]
+
+    protected_rows: List[Dict[str, str]] = []
+    remaining_quarantine_rows: List[Dict[str, str]] = []
+
+    for row in quarantine_rows:
+        sku = (row.get("SKU") or "").strip()
+        product_id = (row.get("ProductID") or "").strip()
+        rule = _match_warehouse_only_rule(sku, rules) if sku else None
+
+        if rule and product_id:
+            protected_rows.append({
+                "ProductID": product_id,
+                "SKU": sku,
+                "Parent SKU": row.get("Parent SKU", ""),
+                "Name": row.get("Name", ""),
+                "Suppliers": row.get("Suppliers", ""),
+                "Supplier SKUs": row.get("Supplier SKUs", ""),
+                "match_type": rule["match_type"],
+                "rule_value": rule["value"],
+                "rule_reason": rule["reason"],
+                "stock_strategy": "warehouse_only",
+                "stock_location": "Warehouse Stock",
+                "sellable_stock_location": "",
+                "preserve_existing_locations": "yes",
+                "warehouse_safe_mode": "yes",
+                "skip_stock_location_update": "yes",
+                "allow_stock_location_update": "no",
+                "target_action": "do_not_append_to_supplier_stock_target",
+                "protected_reason": "warehouse_only_prime_product_inventory_managed_by_storefeeder_warehouse_stock",
+                "source_report_reason": row.get("quarantine_reason", ""),
+            })
+        else:
+            remaining_quarantine_rows.append(row)
+
+    _write_csv(quarantine_path, quarantine_fields, remaining_quarantine_rows)
+    _write_csv(protected_path, protected_fields, protected_rows)
 
     summary = _summary_to_dict(summary_rows)
 
-    summary["quarantine_rows"] = str(len(quarantine_rows))
+    summary["quarantine_rows"] = str(len(remaining_quarantine_rows))
+    summary["warehouse_only_protected_external_rows"] = str(len(protected_rows))
+    summary["warehouse_only_rules_loaded"] = str(len(rules))
     summary["override_skus_loaded"] = str(len(overrides))
     summary["override_skus_existing"] = str(sum(1 for sku in overrides if sku in target_skus or sku in skipped_skus))
     summary["override_skus_ready"] = str(sum(1 for sku in overrides if sku in ready_skus))
-    summary["override_skus_quarantined"] = str(sum(1 for sku in overrides if sku in quarantine_skus))
+    summary["override_skus_quarantined"] = str(sum(1 for sku in overrides if sku in _sku_set(remaining_quarantine_rows)))
     summary["override_skus_not_found"] = str(appended_missing)
 
     if not summary_fields:
@@ -217,12 +326,18 @@ def _postprocess_reports(args: argparse.Namespace) -> None:
 
     _write_csv(summary_path, summary_fields, _dict_to_summary(summary))
 
+    print()
+    print("Warehouse-only protected external post-process:")
+    print(f"  Rules loaded: {len(rules)}")
+    print(f"  Protected external rows: {len(protected_rows)}")
+    print(f"  Updated: {protected_path}")
+    print(f"  Updated: {quarantine_path}")
+    print(f"  Updated: {summary_path}")
+
     if appended_missing:
         print()
         print("Override visibility post-process:")
         print(f"  Added {appended_missing} missing override SKU(s) to quarantine.")
-        print(f"  Updated: {quarantine_path}")
-        print(f"  Updated: {summary_path}")
 
 
 def main() -> int:
