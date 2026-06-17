@@ -4,7 +4,6 @@ Set-Location "C:\shopify_updater_amazon_work"
 
 $Py = "C:\Users\salah\AppData\Local\Programs\Python\Python311\python.exe"
 
-# Load .env for scheduled task context
 if (Test-Path ".env") {
   Get-Content ".env" | ForEach-Object {
     $line = $_.Trim()
@@ -16,28 +15,15 @@ if (Test-Path ".env") {
   }
 }
 
-$LogDir = "reports\auto_enrich_new_products_logs"
+$LogDir = "reports\new_product_onboarding_delta_logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $RunId = Get-Date -Format yyyyMMdd_HHmmss
 $LogPath = "$LogDir\$RunId.log"
 
-"== refresh supplier stock files ==" *> $LogPath
-& $Py scripts\refresh_supplier_stock_files.py `
-  --ralawise-out data\RALAWISE_stock_lvl.csv `
-  --uneek-out data\Uneek_stock_levels.csv *>> $LogPath
-
+"== new product onboarding delta ==" *> $LogPath
+& $Py scripts\run_new_product_onboarding_delta.py @args *>> $LogPath
 $ExitCode = $LASTEXITCODE
-if ($ExitCode -ne 0) {
-  Get-Content $LogPath
-  exit $ExitCode
-}
 
-"== new product onboarding delta ==" *>> $LogPath
-& $Py scripts\run_new_product_onboarding_delta.py `
-  --execute `
-  --create-missing-product-suppliers *>> $LogPath
-
-$ExitCode = $LASTEXITCODE
 Get-Content $LogPath
 exit $ExitCode
