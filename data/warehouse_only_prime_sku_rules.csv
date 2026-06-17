@@ -1,3 +1,4 @@
-﻿match_type,value,reason
+match_type,value,reason
 exact,PRINT-DZU8Y-RL100,amazon_prime_warehouse_only
 prefix,EMB-CSTMINST-BC045,amazon_prime_warehouse_only_family
+prefix,PRINT-DZU8Y-RL100,amazon_prime_warehouse_only
