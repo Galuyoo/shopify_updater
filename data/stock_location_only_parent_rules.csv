@@ -1,0 +1,2 @@
+﻿parent_product_id,parent_sku,supplier,stock_file,stock_sku_column,stock_qty_column,stock_location
+14156294,15325286171001,Ralawise,data\RALAWISE_stock_lvl.csv,SKU,free,Warehouse Stock
