@@ -22,8 +22,6 @@ from scripts.promote_exact_supplier_matches import (
     _append_targets,
     _create_and_verify_product_supplier,
     _exact_supplier_matches,
-    _has_stock_location,
-    _qty_to_int,
     _readback_contains_supplier,
     _target_row,
 )
@@ -86,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--only-sku", help="Runtime filter for manual testing. Not a code rule.")
+    parser.add_argument("--refresh-catalogue-snapshot-only", action="store_true")
+    parser.add_argument("--force-save-catalogue-snapshot", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--create-missing-product-suppliers", action="store_true")
     parser.add_argument("--supplier-costs", type=int, default=0)
@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--limit must be zero or greater")
     if args.create_missing_product_suppliers and not args.execute:
         parser.error("--create-missing-product-suppliers requires --execute")
+    if args.refresh_catalogue_snapshot_only and args.only_sku:
+        parser.error("--refresh-catalogue-snapshot-only cannot be combined with --only-sku")
+    if args.refresh_catalogue_snapshot_only and args.execute:
+        parser.error("--refresh-catalogue-snapshot-only cannot be combined with --execute")
     return args
 
 
@@ -107,10 +111,15 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
-    products = _load_products(client, args.page_size, args.limit)
-    products = _filter_only_sku(products, args.only_sku)
-    current_catalogue = _build_catalogue_snapshot(products)
+    full_products = _load_products(client, args.page_size, args.limit)
+    current_catalogue = _build_catalogue_snapshot(full_products)
     previous_catalogue = _read_catalogue_snapshot(args.catalogue_snapshot_dir / "current_catalogue_snapshot.csv")
+    if args.refresh_catalogue_snapshot_only:
+        _save_catalogue_snapshot(args.catalogue_snapshot_dir, current_catalogue, run_id, force=args.force_save_catalogue_snapshot)
+        print("StoreFeeder catalogue snapshot refreshed")
+        print(_snapshot_summary(current_catalogue, previous_catalogue, args.catalogue_snapshot_dir).to_string(index=False))
+        return 0
+    products = _filter_only_sku(full_products, args.only_sku)
     catalogue_delta = _catalogue_delta(current_catalogue, previous_catalogue)
     new_parent_families = _new_parent_families_detected(current_catalogue, catalogue_delta)
     new_children = _new_children_detected(catalogue_delta)
@@ -201,8 +210,8 @@ def main() -> int:
 
     if not setup_failures.empty:
         raise SystemExit(f"Stopped because ProductSupplier setup failures were found: {len(setup_failures)}")
-    if args.execute:
-        _save_catalogue_snapshot(args.catalogue_snapshot_dir, current_catalogue)
+    if args.execute and not args.only_sku:
+        _save_catalogue_snapshot(args.catalogue_snapshot_dir, current_catalogue, run_id, force=args.force_save_catalogue_snapshot)
     return 0
 
 
@@ -371,24 +380,22 @@ def run_delta_onboarding(
         elif not already_attached and execute and not create_missing_product_suppliers:
             setup_status = "missing_product_supplier_execute_blocked"
 
-        append_allowed = True
-        stock_location_status = "warehouse_stock_update_allowed"
-        if setup_ok and _qty_to_int(candidate.get("supplier_free_stock", 0)) == 0:
-            detail = client.get_product(product_id).get("response", {})
-            if not _has_stock_location(detail, "Warehouse Stock"):
-                stock_location_status = "zero_stock_no_warehouse_stock_row"
-                append_allowed = False
-
-        if setup_ok and append_allowed:
+        if setup_ok:
             target_row = _target_row(product, candidate)
             append_rows.append(target_row)
-            promoted_rows.append(_promoted_row(product, candidate, setup_status, "append_to_normal_supplier_target", "exact unique supplier SKU match; ProductSupplier ready"))
+            promoted_rows.append(
+                _promoted_row(
+                    product,
+                    candidate,
+                    setup_status,
+                    "append_to_normal_supplier_target",
+                    "exact unique supplier SKU match; ProductSupplier ready; append target even when supplier_free_stock is 0",
+                )
+            )
             processed_new += 1
             if execute:
                 _save_processed(processed, state_key, product_id, sku, "promoted", "exact_unique_supplier_match_promoted", run_id)
                 _clear_pending(pending, product_id, sku)
-        elif setup_ok and not append_allowed:
-            quarantine_rows.append(_quarantine_row(product, stock_location_status, "supplier_setup_only_no_target_append: zero stock has no Warehouse Stock row; target append delayed until safe"))
         else:
             quarantine_rows.append(_quarantine_row(product, setup_status, "ProductSupplier relationship missing or failed"))
 
@@ -487,13 +494,38 @@ def _read_catalogue_snapshot(path: Path) -> pd.DataFrame:
     return snapshot[CATALOGUE_COLUMNS].copy()
 
 
-def _save_catalogue_snapshot(snapshot_dir: Path, current_catalogue: pd.DataFrame) -> None:
+def _save_catalogue_snapshot(snapshot_dir: Path, current_catalogue: pd.DataFrame, run_id: str, *, force: bool = False) -> None:
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     current_path = snapshot_dir / "current_catalogue_snapshot.csv"
     previous_path = snapshot_dir / "previous_catalogue_snapshot.csv"
+    timestamped_path = snapshot_dir / f"current_catalogue_snapshot_{run_id}.csv"
+    previous_catalogue = _read_catalogue_snapshot(current_path)
+    if not force and not previous_catalogue.empty:
+        previous_count = len(previous_catalogue)
+        current_count = len(current_catalogue)
+        minimum_safe_count = max(1, int(previous_count * 0.8))
+        if current_count < minimum_safe_count:
+            raise SystemExit(
+                "Refusing to save catalogue snapshot because current row count "
+                f"({current_count}) is suspiciously small compared with previous snapshot "
+                f"({previous_count}). Use --force-save-catalogue-snapshot to override."
+            )
     if current_path.exists():
         shutil.copy2(current_path, previous_path)
     current_catalogue.to_csv(current_path, index=False)
+    current_catalogue.to_csv(timestamped_path, index=False)
+
+
+def _snapshot_summary(current_catalogue: pd.DataFrame, previous_catalogue: pd.DataFrame, snapshot_dir: Path) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"metric": "current_rows", "value": len(current_catalogue)},
+            {"metric": "previous_rows", "value": len(previous_catalogue)},
+            {"metric": "snapshot_dir", "value": str(snapshot_dir)},
+            {"metric": "current_snapshot", "value": str(snapshot_dir / "current_catalogue_snapshot.csv")},
+        ],
+        columns=SUMMARY_COLUMNS,
+    )
 
 
 def _catalogue_delta(current: pd.DataFrame, previous: pd.DataFrame) -> pd.DataFrame:
