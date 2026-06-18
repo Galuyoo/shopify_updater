@@ -17,14 +17,16 @@ from scripts.export_storefeeder_products import fetch_products
 from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig
 from src.storefeeder_stock_export import read_csv
 
-REGISTRY_COLUMNS = ["parent_sku", "reason", "registered_at", "ProductID", "Name"]
-RULE_COLUMNS = ["match_type", "value", "reason"]
+REGISTRY_COLUMNS = ["parent_sku", "reason", "registered_at", "ProductID", "Name", "stock_update_mode"]
+RULE_COLUMNS = ["match_type", "value", "reason", "stock_update_mode"]
+VALID_MODES = {"full_protect", "supplier_info_only_manual_inventory"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Register an Amazon Prime parent SKU as warehouse-only protected inventory.")
     parser.add_argument("--parent-sku", required=True)
     parser.add_argument("--reason", default="amazon_prime_warehouse_only")
+    parser.add_argument("--mode", choices=sorted(VALID_MODES), default="full_protect")
     parser.add_argument("--registry-file", type=Path, default=Path("data/amazon_prime_parent_skus.csv"))
     parser.add_argument("--warehouse-only-rules", type=Path, default=Path("data/warehouse_only_prime_sku_rules.csv"))
     parser.add_argument("--target-file", type=Path, default=Path("data/storefeeder_supplier_stock_update_targets.csv"))
@@ -64,8 +66,8 @@ def main() -> int:
 
     family = _build_family(parent_sku, parent_id, parent_name, products, detail)
 
-    _upsert_registry(args.registry_file, parent_sku, args.reason, parent_id, parent_name)
-    _ensure_prefix_rule(args.warehouse_only_rules, parent_sku, args.reason)
+    _upsert_registry(args.registry_file, parent_sku, args.reason, parent_id, parent_name, args.mode)
+    _ensure_prefix_rule(args.warehouse_only_rules, parent_sku, args.reason, args.mode)
 
     supplier_conflicts = _supplier_feed_conflicts(family, args.ralawise_stock, args.uneek_stock)
     target_conflicts = _target_conflicts(family, args.target_file)
@@ -82,6 +84,7 @@ def main() -> int:
     summary = pd.DataFrame([
         {"metric": "parent_sku", "value": parent_sku},
         {"metric": "reason", "value": args.reason},
+        {"metric": "stock_update_mode", "value": args.mode},
         {"metric": "parent_found_in_storefeeder", "value": "yes" if parent_id else "no"},
         {"metric": "ProductID", "value": parent_id},
         {"metric": "protected_family_rows", "value": len(family)},
@@ -167,7 +170,7 @@ def _build_family(parent_sku: str, parent_id: str, parent_name: str, products: l
     return rows
 
 
-def _upsert_registry(path: Path, parent_sku: str, reason: str, product_id: str, name: str) -> None:
+def _upsert_registry(path: Path, parent_sku: str, reason: str, product_id: str, name: str, mode: str) -> None:
     rows = _read_csv_rows(path, REGISTRY_COLUMNS)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -178,6 +181,7 @@ def _upsert_registry(path: Path, parent_sku: str, reason: str, product_id: str, 
             row["registered_at"] = now
             row["ProductID"] = product_id
             row["Name"] = name
+            row["stock_update_mode"] = mode
             found = True
 
     if not found:
@@ -187,12 +191,13 @@ def _upsert_registry(path: Path, parent_sku: str, reason: str, product_id: str, 
             "registered_at": now,
             "ProductID": product_id,
             "Name": name,
+            "stock_update_mode": mode,
         })
 
     _write_csv_rows(path, REGISTRY_COLUMNS, rows)
 
 
-def _ensure_prefix_rule(path: Path, parent_sku: str, reason: str) -> None:
+def _ensure_prefix_rule(path: Path, parent_sku: str, reason: str, mode: str) -> None:
     rows = _read_csv_rows(path, RULE_COLUMNS)
 
     # Remove exact duplicate rows for same value, then guarantee one prefix rule.
@@ -204,13 +209,13 @@ def _ensure_prefix_rule(path: Path, parent_sku: str, reason: str) -> None:
         value = str(row.get("value", "")).strip()
         if value.casefold() == parent_sku.casefold() and match_type == "prefix":
             if not prefix_exists:
-                clean_rows.append({"match_type": "prefix", "value": parent_sku, "reason": reason})
+                clean_rows.append({"match_type": "prefix", "value": parent_sku, "reason": reason, "stock_update_mode": mode})
                 prefix_exists = True
             continue
         clean_rows.append(row)
 
     if not prefix_exists:
-        clean_rows.append({"match_type": "prefix", "value": parent_sku, "reason": reason})
+        clean_rows.append({"match_type": "prefix", "value": parent_sku, "reason": reason, "stock_update_mode": mode})
 
     _write_csv_rows(path, RULE_COLUMNS, clean_rows)
 
@@ -302,7 +307,10 @@ def _read_csv_rows(path: Path, columns: list[str]) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append({col: str(row.get(col, "")).strip() for col in columns})
+            normalized = {col: str(row.get(col, "")).strip() for col in columns}
+            if "stock_update_mode" in columns and not normalized.get("stock_update_mode"):
+                normalized["stock_update_mode"] = "full_protect"
+            rows.append(normalized)
     return rows
 
 

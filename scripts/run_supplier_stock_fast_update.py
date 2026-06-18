@@ -188,6 +188,7 @@ def main() -> int:
 
     paths = {
         "fast_stock_payload_preview": out_dir / "fast_stock_payload_preview.csv",
+        "supplier_info_only_payload_preview": out_dir / "supplier_info_only_payload_preview.csv",
         "fast_stock_location_payload_preview": out_dir / "fast_stock_location_payload_preview.csv",
         "fast_stock_location_zero_payload_preview": out_dir / "fast_stock_location_zero_payload_preview.csv",
         "fast_stock_location_zero_safety_skips": out_dir / "fast_stock_location_zero_safety_skips.csv",
@@ -196,6 +197,8 @@ def main() -> int:
         "fast_stock_channel_safety_skips": out_dir / "fast_stock_channel_safety_skips.csv",
     }
     preview.to_csv(paths["fast_stock_payload_preview"], index=False)
+    supplier_info_only_preview = _supplier_info_only_payload_preview(preview, targets)
+    supplier_info_only_preview.to_csv(paths["supplier_info_only_payload_preview"], index=False)
     stock_location_preview.to_csv(paths["fast_stock_location_payload_preview"], index=False)
     zero_location_preview.to_csv(paths["fast_stock_location_zero_payload_preview"], index=False)
     zero_location_safety_skips.to_csv(paths["fast_stock_location_zero_safety_skips"], index=False)
@@ -210,6 +213,7 @@ def main() -> int:
         channel_safety_skips=channel_safety_skips,
         zero_location_preview=zero_location_preview,
         zero_location_safety_skips=zero_location_safety_skips,
+        supplier_info_only_preview=supplier_info_only_preview,
     )
     summary.to_csv(paths["fast_stock_summary"], index=False)
 
@@ -259,6 +263,7 @@ def main() -> int:
         channel_safety_skips=channel_safety_skips,
         zero_location_preview=zero_location_preview,
         zero_location_safety_skips=zero_location_safety_skips,
+        supplier_info_only_preview=supplier_info_only_preview,
         zero_other_locations_success=_csv_count(zero_location_live_paths["fast_stock_location_zero_update_success"]),
         zero_other_locations_failures=zero_location_update_failures,
     )
@@ -378,8 +383,11 @@ def build_fast_payload_preview(
     valid["_explicit_skip_stock_location_update"] = valid["skip_stock_location_update"].astype(str).str.strip().str.casefold().isin(["yes", "true", "1", "y"])
     valid["_stock_location_skip_reason"] = ""
     valid.loc[valid["_explicit_skip_stock_location_update"], "_stock_location_skip_reason"] = "explicit_skip_stock_location_update"
-    warehouse_only_mask = valid["stock_strategy"].astype(str).str.strip().str.casefold().eq("warehouse_only")
+    strategy_key = valid["stock_strategy"].astype(str).str.strip().str.casefold()
+    warehouse_only_mask = strategy_key.eq("warehouse_only")
+    supplier_info_only_mask = strategy_key.eq("supplier_info_only_manual_inventory")
     valid.loc[warehouse_only_mask & valid["_stock_location_skip_reason"].eq(""), "_stock_location_skip_reason"] = "warehouse_only_stock_location_protected"
+    valid.loc[supplier_info_only_mask & valid["_stock_location_skip_reason"].eq(""), "_stock_location_skip_reason"] = "supplier_info_only_manual_inventory_skip"
     implicit_channel_skip = (
         valid["_channel_decorated"]
         & ~valid["_allow_stock_location_update"]
@@ -494,7 +502,7 @@ def _zero_other_locations_preview(valid: pd.DataFrame) -> tuple[pd.DataFrame, pd
         allow_location_update = bool(row.get("_allow_stock_location_update", False))
         explicit_skip = bool(row.get("_explicit_skip_stock_location_update", False))
 
-        if strategy == "warehouse_only":
+        if strategy in {"warehouse_only", "supplier_info_only_manual_inventory"}:
             continue
         if strategy != "supplier_synced_inventory":
             skip_rows.append(_zero_location_skip_row(row, keep_location, "ambiguous_or_missing_stock_strategy"))
@@ -813,6 +821,17 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().casefold() in ["true", "1", "yes", "y", "success"]
 
 
+
+def _supplier_info_only_payload_preview(preview: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:
+    if preview.empty or targets.empty or "stock_strategy" not in targets.columns:
+        return pd.DataFrame(columns=PAYLOAD_COLUMNS)
+    target_keys = targets[targets["stock_strategy"].fillna("").astype(str).str.strip().str.casefold().eq("supplier_info_only_manual_inventory")].copy()
+    if target_keys.empty:
+        return pd.DataFrame(columns=PAYLOAD_COLUMNS)
+    keys = set(zip(target_keys["ProductID"].astype(str), target_keys["SupplierSKU"].astype(str).str.upper()))
+    subset = preview[preview.apply(lambda row: (str(row["ProductID"]), str(row["SupplierSKU"]).upper()) in keys, axis=1)].copy()
+    return subset.reindex(columns=PAYLOAD_COLUMNS, fill_value="")
+
 def _summary_frame(
     targets: pd.DataFrame,
     preview: pd.DataFrame,
@@ -828,17 +847,22 @@ def _summary_frame(
     channel_safety_skips: pd.DataFrame | None = None,
     zero_location_preview: pd.DataFrame | None = None,
     zero_location_safety_skips: pd.DataFrame | None = None,
+    supplier_info_only_preview: pd.DataFrame | None = None,
     zero_other_locations_success: int = 0,
     zero_other_locations_failures: int = 0,
 ) -> pd.DataFrame:
     channel_safety_skips = channel_safety_skips if channel_safety_skips is not None else pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
     zero_location_preview = zero_location_preview if zero_location_preview is not None else pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
     zero_location_safety_skips = zero_location_safety_skips if zero_location_safety_skips is not None else pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
+    supplier_info_only_preview = supplier_info_only_preview if supplier_info_only_preview is not None else pd.DataFrame(columns=PAYLOAD_COLUMNS)
     return pd.DataFrame(
         [
             {"metric": "dry_run", "value": "no" if live else "yes"},
             {"metric": "target_rows", "value": len(targets)},
             {"metric": "supplier_payload_rows", "value": len(preview)},
+            {"metric": "supplier_info_only_rows", "value": len(supplier_info_only_preview)},
+            {"metric": "supplier_info_only_supplier_updates", "value": len(supplier_info_only_preview)},
+            {"metric": "supplier_info_only_inventory_skips", "value": len(supplier_info_only_preview)},
             {"metric": "stock_location_payload_rows", "value": len(stock_location_preview)},
             {"metric": "zero_other_locations_payload_rows", "value": len(zero_location_preview)},
             {"metric": "zero_other_locations_safety_skips", "value": len(zero_location_safety_skips)},
