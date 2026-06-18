@@ -66,6 +66,9 @@ CATALOGUE_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "row_signature", 
 DELTA_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "delta_status", "delta_reason"]
 NEW_PARENT_COLUMNS = ["ProductID", "SKU", "Name", "child_count", "delta_status", "delta_reason"]
 NEW_CHILD_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "delta_status", "delta_reason"]
+TARGET_GAP_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "supplier", "SupplierID", "Supplier.Name", "SupplierSKU", "supplier_free_stock", "recovery_reason"]
+MISSING_PRODUCT_SUPPLIER_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "supplier", "SupplierID", "Supplier.Name", "SupplierSKU", "status", "action", "reason"]
+PENDING_RETRY_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "pending_status", "pending_reason", "work_source"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,6 +125,7 @@ def main() -> int:
     products = _filter_only_sku(full_products, args.only_sku)
     catalogue_delta = _catalogue_delta(current_catalogue, previous_catalogue)
     new_parent_families = _new_parent_families_detected(current_catalogue, catalogue_delta)
+    changed_parent_families = _changed_parent_families_detected(current_catalogue, catalogue_delta)
     new_children = _new_children_detected(catalogue_delta)
     targets = _read_targets(args.target_file)
     supplier_ids = _load_supplier_ids(args.supplier_id_map)
@@ -169,6 +173,8 @@ def main() -> int:
         _write_state(args.state_file, new_state)
 
     summary = _replace_summary_metric(summary, "target_rows_appended", appended_count)
+    if args.execute:
+        summary = _replace_summary_metric(summary, "target_gap_rows_appended", result.get("target_gap_rows_ready", 0) if appended_count else 0)
     summary = _replace_summary_metric(summary, "execute_mode", "yes" if args.execute else "no")
     summary = _replace_summary_metric(summary, "create_missing_product_suppliers", "yes" if args.create_missing_product_suppliers else "no")
 
@@ -178,7 +184,11 @@ def main() -> int:
         "previous_catalogue_snapshot": out_dir / "previous_catalogue_snapshot.csv",
         "catalogue_delta": out_dir / "catalogue_delta.csv",
         "new_parent_families_detected": out_dir / "new_parent_families_detected.csv",
+        "changed_parent_families_detected": out_dir / "changed_parent_families_detected.csv",
         "new_children_detected": out_dir / "new_children_detected.csv",
+        "recovered_target_gaps": out_dir / "recovered_target_gaps.csv",
+        "recovered_missing_product_suppliers": out_dir / "recovered_missing_product_suppliers.csv",
+        "pending_retry_processed": out_dir / "pending_retry_processed.csv",
         "promoted_supplier_synced": out_dir / "promoted_supplier_synced.csv",
         "protected_warehouse_only": out_dir / "protected_warehouse_only.csv",
         "parent_aggregates": out_dir / "parent_aggregates.csv",
@@ -192,7 +202,11 @@ def main() -> int:
     previous_catalogue.to_csv(paths["previous_catalogue_snapshot"], index=False)
     catalogue_delta.to_csv(paths["catalogue_delta"], index=False)
     new_parent_families.to_csv(paths["new_parent_families_detected"], index=False)
+    changed_parent_families.to_csv(paths["changed_parent_families_detected"], index=False)
     new_children.to_csv(paths["new_children_detected"], index=False)
+    result["target_gaps"].to_csv(paths["recovered_target_gaps"], index=False)
+    result["missing_product_suppliers"].to_csv(paths["recovered_missing_product_suppliers"], index=False)
+    result["pending_retry_processed"].to_csv(paths["pending_retry_processed"], index=False)
     promoted.to_csv(paths["promoted_supplier_synced"], index=False)
     protected.to_csv(paths["protected_warehouse_only"], index=False)
     parents.to_csv(paths["parent_aggregates"], index=False)
@@ -242,11 +256,12 @@ def run_delta_onboarding(
     existing_skus = {value.casefold() for value in targets["SKU"].fillna("").astype(str).str.strip() if value}
     children_by_parent = _children_by_parent(products)
     parent_skus = set(children_by_parent.keys())
+    target_gaps = _target_gap_candidates(products, targets, supplier_ids, supplier_stock, warehouse_rules, children_by_parent)
     state = _normalize_state(state)
     processed = state.setdefault("processed", {})
     pending = state.setdefault("pending", {})
     if use_catalogue_delta:
-        products, delta_stats = _filter_products_for_catalogue_delta(products, catalogue_delta, children_by_parent, pending)
+        products, delta_stats = _filter_products_for_catalogue_delta(products, catalogue_delta, children_by_parent, pending, target_gaps)
     else:
         delta_stats = {
             "catalogue_delta_enabled": "no",
@@ -257,8 +272,10 @@ def run_delta_onboarding(
             "catalogue_delta_removed_products": 0,
             "catalogue_delta_new_numeric_parent_families": 0,
             "pending_retry_rows_selected": 0,
+            "target_gap_rows_detected": len(target_gaps),
         }
 
+    pending_retry_processed = _pending_retry_processed_report(products, pending)
     promoted_rows: list[dict[str, Any]] = []
     protected_rows: list[dict[str, Any]] = []
     parent_rows: list[dict[str, Any]] = []
@@ -266,6 +283,8 @@ def run_delta_onboarding(
     setup_success_rows: list[dict[str, Any]] = []
     setup_failure_rows: list[dict[str, Any]] = []
     append_rows: list[dict[str, Any]] = []
+    missing_product_supplier_rows: list[dict[str, Any]] = []
+    target_gap_rows_ready = 0
 
     scanned_variants = 0
     skipped_existing = 0
@@ -354,6 +373,8 @@ def run_delta_onboarding(
         already_attached = _product_has_supplier(client, product_id, candidate)
         setup_ok = already_attached
         setup_status = "already_attached" if already_attached else "missing_product_supplier_preview_only"
+        if not already_attached:
+            missing_product_supplier_rows.append(_missing_product_supplier_row(product, candidate, setup_status, "create_in_execute" if execute and create_missing_product_suppliers else "preview_only", "exact supplier match but ProductSupplier is missing"))
         if not already_attached and not execute:
             promoted_rows.append(
                 _promoted_row(
@@ -383,6 +404,8 @@ def run_delta_onboarding(
         if setup_ok:
             target_row = _target_row(product, candidate)
             append_rows.append(target_row)
+            if str(product.get("_work_source", "")).strip() == "target_gap_recovery":
+                target_gap_rows_ready += 1
             promoted_rows.append(
                 _promoted_row(
                     product,
@@ -406,6 +429,7 @@ def run_delta_onboarding(
     setup_success = pd.DataFrame(setup_success_rows, columns=SETUP_SUCCESS_COLUMNS)
     setup_failures = pd.DataFrame(setup_failure_rows, columns=SETUP_FAILURE_COLUMNS)
     append_ready = pd.DataFrame(append_rows, columns=TARGET_COLUMNS)
+    missing_product_suppliers = pd.DataFrame(missing_product_supplier_rows, columns=MISSING_PRODUCT_SUPPLIER_COLUMNS)
 
     summary = pd.DataFrame(
         [
@@ -419,6 +443,11 @@ def run_delta_onboarding(
             {"metric": "catalogue_delta_removed_products", "value": delta_stats["catalogue_delta_removed_products"]},
             {"metric": "catalogue_delta_new_numeric_parent_families", "value": delta_stats["catalogue_delta_new_numeric_parent_families"]},
             {"metric": "pending_retry_rows_selected", "value": delta_stats["pending_retry_rows_selected"]},
+            {"metric": "target_gap_rows_detected", "value": delta_stats["target_gap_rows_detected"]},
+            {"metric": "target_gap_rows_appended", "value": 0},
+            {"metric": "missing_product_supplier_rows_detected", "value": len(missing_product_suppliers)},
+            {"metric": "missing_product_supplier_rows_created", "value": len(setup_success)},
+            {"metric": "changed_parent_families_detected", "value": delta_stats.get("changed_parent_families_detected", 0)},
             {"metric": "scanned_products", "value": len(products)},
             {"metric": "scanned_variants", "value": scanned_variants},
             {"metric": "existing_target_rows", "value": len(targets)},
@@ -445,6 +474,10 @@ def run_delta_onboarding(
         "setup_success": setup_success,
         "setup_failures": setup_failures,
         "append_ready": append_ready,
+        "target_gaps": target_gaps,
+        "missing_product_suppliers": missing_product_suppliers,
+        "pending_retry_processed": pending_retry_processed,
+        "target_gap_rows_ready": target_gap_rows_ready,
         "summary": summary,
         "state": state,
     }
@@ -582,11 +615,131 @@ def _catalogue_delta(current: pd.DataFrame, previous: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(rows, columns=DELTA_COLUMNS)
 
 
+
+def _target_gap_candidates(
+    products: pd.DataFrame,
+    targets: pd.DataFrame,
+    supplier_ids: pd.DataFrame,
+    supplier_stock: pd.DataFrame,
+    warehouse_rules: list[dict[str, str]],
+    children_by_parent: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    if products.empty:
+        return pd.DataFrame(columns=TARGET_GAP_COLUMNS)
+    existing_product_ids = set(targets.get("ProductID", pd.Series(dtype=str)).fillna("").astype(str).str.strip())
+    existing_skus = {value.casefold() for value in targets.get("SKU", pd.Series(dtype=str)).fillna("").astype(str).str.strip() if value}
+    numeric_parents = {parent for parent in children_by_parent if _is_numeric_parent_sku(parent)}
+    rows: list[dict[str, Any]] = []
+    for _, product in products.iterrows():
+        product_id = str(product.get("ID", "")).strip()
+        sku = str(product.get("SKU", "")).strip()
+        parent_sku = str(product.get("Parent SKU", "")).strip()
+        if not product_id or not sku or not parent_sku:
+            continue
+        if product_id in existing_product_ids or sku.casefold() in existing_skus:
+            continue
+        if parent_sku.casefold() not in numeric_parents:
+            continue
+        if _match_warehouse_only_rule(sku, parent_sku, warehouse_rules):
+            continue
+        exact_matches = _exact_supplier_matches(sku, supplier_ids, supplier_stock)
+        if len(exact_matches) != 1:
+            continue
+        candidate = exact_matches[0]
+        rows.append(
+            {
+                "ProductID": product_id,
+                "SKU": sku,
+                "Parent SKU": parent_sku,
+                "Name": str(product.get("Name", "")).strip(),
+                "supplier": candidate.get("supplier", ""),
+                "SupplierID": candidate.get("SupplierID", ""),
+                "Supplier.Name": candidate.get("Supplier.Name", ""),
+                "SupplierSKU": candidate.get("supplier_sku", ""),
+                "supplier_free_stock": candidate.get("supplier_free_stock", ""),
+                "recovery_reason": "numeric supplier-family child exact-matches supplier feed but is missing from target file",
+            }
+        )
+    return pd.DataFrame(rows, columns=TARGET_GAP_COLUMNS)
+
+
+def _missing_product_supplier_row(product: pd.Series, candidate: dict[str, Any], status: str, action: str, reason: str) -> dict[str, Any]:
+    return {
+        "ProductID": str(product.get("ID", "")).strip(),
+        "SKU": str(product.get("SKU", "")).strip(),
+        "Parent SKU": str(product.get("Parent SKU", "")).strip(),
+        "Name": str(product.get("Name", "")).strip(),
+        "supplier": candidate.get("supplier", ""),
+        "SupplierID": candidate.get("SupplierID", ""),
+        "Supplier.Name": candidate.get("Supplier.Name", ""),
+        "SupplierSKU": candidate.get("supplier_sku", ""),
+        "status": status,
+        "action": action,
+        "reason": reason,
+    }
+
+
+def _pending_retry_processed_report(products: pd.DataFrame, pending: dict[str, Any]) -> pd.DataFrame:
+    if products.empty or "_work_source" not in products.columns:
+        return pd.DataFrame(columns=PENDING_RETRY_COLUMNS)
+    rows: list[dict[str, Any]] = []
+    pending_products = products[products["_work_source"].fillna("").astype(str).eq("pending_retry")]
+    for _, product in pending_products.iterrows():
+        product_id = str(product.get("ID", "")).strip()
+        sku = str(product.get("SKU", "")).strip()
+        pending_row = pending.get(_state_key(product_id, sku), {}) if isinstance(pending, dict) else {}
+        rows.append(
+            {
+                "ProductID": product_id,
+                "SKU": sku,
+                "Parent SKU": str(product.get("Parent SKU", "")).strip(),
+                "Name": str(product.get("Name", "")).strip(),
+                "pending_status": str(pending_row.get("supplier_match_status", "")).strip(),
+                "pending_reason": str(pending_row.get("reason", "")).strip(),
+                "work_source": "pending_retry",
+            }
+        )
+    return pd.DataFrame(rows, columns=PENDING_RETRY_COLUMNS)
+
+
+def _changed_parent_families_detected(current_catalogue: pd.DataFrame, catalogue_delta: pd.DataFrame) -> pd.DataFrame:
+    if catalogue_delta.empty:
+        return pd.DataFrame(columns=NEW_PARENT_COLUMNS)
+    changed = catalogue_delta[catalogue_delta["delta_status"].eq("changed")].copy()
+    changed = changed[changed["SKU"].fillna("").astype(str).map(_is_numeric_parent_sku)].copy()
+    if changed.empty:
+        return pd.DataFrame(columns=NEW_PARENT_COLUMNS)
+    child_counts = current_catalogue[current_catalogue["Parent SKU"].fillna("").astype(str).str.strip().ne("")].groupby(
+        current_catalogue["Parent SKU"].fillna("").astype(str).str.strip().str.casefold()
+    ).size().to_dict()
+    rows = []
+    for _, row in changed.iterrows():
+        sku = str(row.get("SKU", "")).strip()
+        rows.append(
+            {
+                "ProductID": str(row.get("ProductID", "")).strip(),
+                "SKU": sku,
+                "Name": str(row.get("Name", "")).strip(),
+                "child_count": int(child_counts.get(sku.casefold(), 0)),
+                "delta_status": str(row.get("delta_status", "")).strip(),
+                "delta_reason": str(row.get("delta_reason", "")).strip(),
+            }
+        )
+    return pd.DataFrame(rows, columns=NEW_PARENT_COLUMNS)
+
+
+def _count_changed_numeric_parent_families(catalogue_delta: pd.DataFrame) -> int:
+    if catalogue_delta is None or catalogue_delta.empty:
+        return 0
+    changed = catalogue_delta[catalogue_delta["delta_status"].eq("changed")].copy()
+    return int(changed["SKU"].fillna("").astype(str).map(_is_numeric_parent_sku).sum())
+
 def _filter_products_for_catalogue_delta(
     products: pd.DataFrame,
     catalogue_delta: pd.DataFrame | None,
     children_by_parent: dict[str, pd.DataFrame],
     pending: dict[str, Any] | None,
+    target_gaps: pd.DataFrame,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     products = products.copy()
     products["_work_source"] = "catalogue_delta"
@@ -624,6 +777,16 @@ def _filter_products_for_catalogue_delta(
                 if child_sku:
                     source_by_key.setdefault("SKU:" + child_sku, "catalogue_delta_family_child")
 
+    for _, gap in target_gaps.iterrows():
+        product_id = str(gap.get("ProductID", "")).strip()
+        sku = str(gap.get("SKU", "")).strip()
+        if product_id:
+            selected_product_ids.add(product_id)
+            source_by_key["ProductID:" + product_id] = "target_gap_recovery"
+        if sku:
+            selected_skus.add(sku.casefold())
+            source_by_key["SKU:" + sku.casefold()] = "target_gap_recovery"
+
     pending_count = 0
     for item in pending.values():
         if not isinstance(item, dict):
@@ -660,6 +823,8 @@ def _filter_products_for_catalogue_delta(
         "catalogue_delta_removed_products": int(catalogue_delta.get("delta_status", pd.Series(dtype=str)).eq("removed").sum()) if not catalogue_delta.empty else 0,
         "catalogue_delta_new_numeric_parent_families": len(numeric_parent_families),
         "pending_retry_rows_selected": pending_count,
+        "target_gap_rows_detected": len(target_gaps),
+        "changed_parent_families_detected": _count_changed_numeric_parent_families(catalogue_delta),
     }
     return selected, stats
 
