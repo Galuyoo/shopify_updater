@@ -1,9 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -26,6 +28,7 @@ from src.storefeeder_api import (
     supplier_payload_preview_to_items,
 )
 from src.storefeeder_stock_export import read_csv
+from scripts.run_new_product_onboarding_delta import _load_products as _load_live_products
 
 
 TARGET_COLUMNS = [
@@ -66,10 +69,16 @@ PAYLOAD_COLUMNS = [
 ]
 
 STOCK_LOCATION_PAYLOAD_COLUMNS = [
+    "ProductID",
     "SKU",
+    "SupplierSKU",
     "supplier",
+    "supplier_id",
     "supplier_sku",
     "stock_location",
+    "stock_strategy",
+    "skip_stock_location_update",
+    "allow_stock_location_update",
     "quantity",
     "confidence_status",
     "ProductIDType.IDType",
@@ -87,6 +96,8 @@ CHANNEL_SAFETY_SKIP_COLUMNS = ["ProductID", "SKU", "SupplierSKU", "supplier", "s
 ZERO_LOCATION_PREVIEW_COLUMNS = [
     "SKU",
     "ProductID",
+    "SupplierSKU",
+    "supplier",
     "stock_strategy",
     "keep_stock_location",
     "zero_stock_location",
@@ -104,6 +115,23 @@ ZERO_LOCATION_SAFETY_SKIP_COLUMNS = [
 ]
 KNOWN_STOCK_LOCATIONS = ["Ralawise", "Uneek", "Temporary stock location", "Unspecified", "Warehouse Stock"]
 UNSUPPORTED_ZERO_STOCK_LOCATIONS = ["Temporary stock location"]
+PRODUCT_ID_RECONCILIATION_COLUMNS = [
+    "SKU",
+    "SupplierSKU",
+    "supplier",
+    "stock_strategy",
+    "old_ProductID",
+    "new_ProductID",
+    "reason",
+]
+PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS = [
+    "SKU",
+    "SupplierSKU",
+    "supplier",
+    "stock_strategy",
+    "ProductID",
+    "reason",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,6 +148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storefeeder-api-base-url", default="https://rest.storefeeder.com")
     parser.add_argument("--missing-as-zero", action="store_true", help="Explicitly allow missing supplier stock to become zero")
     parser.add_argument("--skip-stock-refresh", action="store_true")
+    parser.add_argument("--scheduled-run", action="store_true", help="Enable scheduled-run stale report guard fields.")
+    parser.add_argument("--verify-live-sample", type=int, default=0)
+    parser.add_argument("--verify-live-strict", action="store_true")
     parser.add_argument(
         "--zero-other-locations-for-supplier-synced",
         action="store_true",
@@ -132,6 +163,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--api-batch-size must be between 1 and 50")
     if args.live_stock_update and args.api_limit is None:
         parser.error("--live-stock-update requires explicit --api-limit for guarded runs")
+    if args.verify_live_sample < 0:
+        parser.error("--verify-live-sample must be zero or greater")
     return args
 
 
@@ -140,6 +173,8 @@ def main() -> int:
     _load_env_file(PROJECT_ROOT / ".env")
     out_dir = args.out_dir or Path("reports/fast_stock_updates") / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    target_file_mtime = _file_mtime(args.targets)
+    current_target_rows = _csv_count(args.targets)
 
     if not args.skip_stock_refresh:
         _run(
@@ -155,6 +190,11 @@ def main() -> int:
         )
 
     targets = read_csv(args.targets)
+    client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
+    live_products = _load_live_products(client, page_size=100, limit=None)
+    product_id_reconciliation, product_id_quarantine, targets = _reconcile_runtime_product_ids(targets, live_products)
+    if args.live_stock_update and not product_id_reconciliation.empty:
+        _backup_and_write_targets(args.targets, targets, out_dir.name)
     ralawise_stock = read_csv(args.ralawise_stock)
     uneek_stock = read_csv(args.uneek_stock)
     supplier_stock = build_supplier_stock_lookup(ralawise_stock, uneek_stock)
@@ -189,21 +229,31 @@ def main() -> int:
     paths = {
         "fast_stock_payload_preview": out_dir / "fast_stock_payload_preview.csv",
         "supplier_info_only_payload_preview": out_dir / "supplier_info_only_payload_preview.csv",
+        "fast_stock_supplier_info_only_payload_preview": out_dir / "fast_stock_supplier_info_only_payload_preview.csv",
         "fast_stock_location_payload_preview": out_dir / "fast_stock_location_payload_preview.csv",
         "fast_stock_location_zero_payload_preview": out_dir / "fast_stock_location_zero_payload_preview.csv",
         "fast_stock_location_zero_safety_skips": out_dir / "fast_stock_location_zero_safety_skips.csv",
         "fast_stock_summary": out_dir / "fast_stock_summary.csv",
         "fast_stock_invalid_rows": out_dir / "fast_stock_invalid_rows.csv",
         "fast_stock_channel_safety_skips": out_dir / "fast_stock_channel_safety_skips.csv",
+        "stale_fast_sync_guard": out_dir / "stale_fast_sync_guard.csv",
+        "fast_stock_product_id_reconciliation": out_dir / "fast_stock_product_id_reconciliation.csv",
+        "fast_stock_product_id_quarantine": out_dir / "fast_stock_product_id_quarantine.csv",
     }
     preview.to_csv(paths["fast_stock_payload_preview"], index=False)
     supplier_info_only_preview = _supplier_info_only_payload_preview(preview, targets)
     supplier_info_only_preview.to_csv(paths["supplier_info_only_payload_preview"], index=False)
+    supplier_info_only_preview.to_csv(paths["fast_stock_supplier_info_only_payload_preview"], index=False)
     stock_location_preview.to_csv(paths["fast_stock_location_payload_preview"], index=False)
     zero_location_preview.to_csv(paths["fast_stock_location_zero_payload_preview"], index=False)
     zero_location_safety_skips.to_csv(paths["fast_stock_location_zero_safety_skips"], index=False)
+    if not product_id_quarantine.empty:
+        product_id_invalid = product_id_quarantine.rename(columns={"reason": "invalid_reason"}).copy()
+        invalid_rows = pd.concat([invalid_rows, product_id_invalid], ignore_index=True, sort=False)
     invalid_rows.to_csv(paths["fast_stock_invalid_rows"], index=False)
     channel_safety_skips.to_csv(paths["fast_stock_channel_safety_skips"], index=False)
+    product_id_reconciliation.to_csv(paths["fast_stock_product_id_reconciliation"], index=False)
+    product_id_quarantine.to_csv(paths["fast_stock_product_id_quarantine"], index=False)
     summary = _summary_frame(
         targets,
         preview,
@@ -214,7 +264,14 @@ def main() -> int:
         zero_location_preview=zero_location_preview,
         zero_location_safety_skips=zero_location_safety_skips,
         supplier_info_only_preview=supplier_info_only_preview,
+        current_target_rows=current_target_rows,
+        target_file_mtime=target_file_mtime,
+        scheduled_run=args.scheduled_run,
+        product_id_reconciliation=product_id_reconciliation,
+        product_id_quarantine=product_id_quarantine,
     )
+    stale_guard = _stale_fast_sync_guard(args.targets, current_target_rows, len(targets), target_file_mtime, args.scheduled_run)
+    stale_guard.to_csv(paths["stale_fast_sync_guard"], index=False)
     summary.to_csv(paths["fast_stock_summary"], index=False)
 
     print("Fast StoreFeeder stock update dry run" if not args.live_stock_update else "Fast StoreFeeder stock update live run")
@@ -225,10 +282,15 @@ def main() -> int:
 
     if not invalid_rows.empty:
         raise SystemExit("Blocked fast stock update because invalid target/stock rows are present.")
+    if current_target_rows != len(targets):
+        raise SystemExit(
+            f"Critical target row count mismatch: current_target_rows={current_target_rows}, "
+            f"target_rows_loaded_this_run={len(targets)}"
+        )
     if preview.empty:
         raise SystemExit("Blocked fast stock update because payload preview is empty.")
     if not args.live_stock_update:
-        print("\nDry-run only. No StoreFeeder API calls were made.")
+        print("\nDry-run only. No StoreFeeder write API calls were made.")
         return 0
 
     items = supplier_payload_preview_to_items(preview)
@@ -237,16 +299,34 @@ def main() -> int:
     stock_location_batches = batch_items(stock_location_items, args.api_batch_size)
     zero_location_items = payload_preview_to_storefeeder_items(_zero_preview_to_stock_location_payload(zero_location_preview))
     zero_location_batches = batch_items(zero_location_items, args.api_batch_size)
-    client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
     live_paths = _send_fast_stock_batches(client, batches, out_dir)
-    location_live_paths, stock_location_retry_count = _send_fast_stock_location_batches(client, stock_location_batches, out_dir)
+    location_live_paths, stock_location_retry_count = _send_fast_stock_location_batches(
+        client,
+        stock_location_batches,
+        out_dir,
+        source_preview=stock_location_preview,
+    )
     zero_location_live_paths, zero_location_retry_count = _send_fast_stock_location_batches(
         client,
         zero_location_batches,
         out_dir,
         file_prefix="fast_stock_location_zero_update",
+        source_preview=_zero_preview_to_stock_location_payload(zero_location_preview),
     )
+    verification_sample = pd.DataFrame()
+    verification_failures = pd.DataFrame()
+    if args.verify_live_sample:
+        verification_sample, verification_failures = _verify_live_sample(client, stock_location_preview, args.verify_live_sample)
+    verification_sample_path = out_dir / "fast_stock_live_verification_sample.csv"
+    verification_failures_path = out_dir / "fast_stock_live_verification_failures.csv"
+    verification_sample.to_csv(verification_sample_path, index=False)
+    verification_failures.to_csv(verification_failures_path, index=False)
     supplier_update_failures = _csv_count(live_paths["fast_stock_update_failures"])
+    supplier_retry_success = _csv_count(live_paths["fast_stock_supplier_update_retry_success"])
+    supplier_retry_failures = _csv_count(live_paths["fast_stock_supplier_update_retry_failures"])
+    supplier_missing_recovered = _csv_count(live_paths["fast_stock_supplier_missing_product_supplier_recovered"])
+    supplier_info_only_success = _supplier_info_only_update_count(live_paths["fast_stock_update_success"], supplier_info_only_preview)
+    supplier_info_only_failures = _supplier_info_only_update_count(live_paths["fast_stock_update_failures"], supplier_info_only_preview)
     stock_location_update_failures = _csv_count(location_live_paths["fast_stock_location_update_failures"])
     zero_location_update_failures = _csv_count(zero_location_live_paths["fast_stock_location_zero_update_failures"])
     summary = _summary_frame(
@@ -266,11 +346,28 @@ def main() -> int:
         supplier_info_only_preview=supplier_info_only_preview,
         zero_other_locations_success=_csv_count(zero_location_live_paths["fast_stock_location_zero_update_success"]),
         zero_other_locations_failures=zero_location_update_failures,
+        supplier_update_initial_failures=supplier_retry_success + supplier_retry_failures,
+        supplier_update_retry_success=supplier_retry_success,
+        supplier_update_retry_failures=supplier_retry_failures,
+        supplier_update_missing_product_supplier_recovered=supplier_missing_recovered,
+        supplier_update_persistent_failures=supplier_update_failures,
+        supplier_info_only_supplier_update_success=supplier_info_only_success,
+        supplier_info_only_supplier_update_failures=supplier_info_only_failures,
+        current_target_rows=current_target_rows,
+        target_file_mtime=target_file_mtime,
+        scheduled_run=args.scheduled_run,
+        product_id_reconciliation=product_id_reconciliation,
+        product_id_quarantine=product_id_quarantine,
     )
     summary.to_csv(paths["fast_stock_summary"], index=False)
     print("\nLive stock update reports:")
     for path in [*live_paths.values(), *location_live_paths.values(), *zero_location_live_paths.values()]:
         print(path)
+    if args.verify_live_sample:
+        print(verification_sample_path)
+        print(verification_failures_path)
+    if args.verify_live_strict and not verification_failures.empty:
+        raise SystemExit(f"Fast stock live verification failed for {len(verification_failures)} sampled rows")
     if supplier_update_failures or stock_location_update_failures or zero_location_update_failures:
         raise SystemExit(
             "Fast stock update completed with failures: "
@@ -279,6 +376,101 @@ def main() -> int:
             f"zero_other_locations_failures={zero_location_update_failures}"
         )
     return 0
+
+
+def _reconcile_runtime_product_ids(targets: pd.DataFrame, products: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if targets.empty:
+        return (
+            pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_COLUMNS),
+            pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS),
+            targets.copy(),
+        )
+    if "SKU" not in targets.columns or "ProductID" not in targets.columns:
+        return (
+            pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_COLUMNS),
+            pd.DataFrame(
+                [{"reason": "target_file_missing_SKU_or_ProductID_columns"}],
+                columns=PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS,
+            ),
+            targets.iloc[0:0].copy(),
+        )
+
+    products = products.copy()
+    if products.empty or "SKU" not in products.columns or "ID" not in products.columns:
+        quarantine = targets.apply(
+            lambda row: _product_id_quarantine_row(row, "live_product_catalogue_unavailable"),
+            axis=1,
+        ).tolist()
+        return (
+            pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_COLUMNS),
+            pd.DataFrame(quarantine, columns=PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS),
+            targets.iloc[0:0].copy(),
+        )
+
+    products["_sku_key"] = products["SKU"].fillna("").astype(str).str.strip().str.casefold()
+    products["_product_id"] = products["ID"].fillna("").astype(str).str.strip()
+    products = products[products["_sku_key"].ne("") & products["_product_id"].ne("")].copy()
+    live_counts = products["_sku_key"].value_counts().to_dict()
+    live_unique = products[~products["_sku_key"].duplicated(keep=False)].set_index("_sku_key")["_product_id"].to_dict()
+
+    reconciled = targets.copy()
+    keep_mask = pd.Series(True, index=reconciled.index)
+    reconciliation_rows: list[dict[str, Any]] = []
+    quarantine_rows: list[dict[str, Any]] = []
+
+    for index, row in reconciled.iterrows():
+        sku = str(row.get("SKU", "")).strip()
+        sku_key = sku.casefold()
+        old_product_id = str(row.get("ProductID", "")).strip()
+        if not sku_key:
+            quarantine_rows.append(_product_id_quarantine_row(row, "missing_target_sku"))
+            keep_mask.loc[index] = False
+            continue
+        if live_counts.get(sku_key, 0) > 1:
+            quarantine_rows.append(_product_id_quarantine_row(row, "duplicate_live_storefeeder_sku"))
+            keep_mask.loc[index] = False
+            continue
+        new_product_id = live_unique.get(sku_key, "")
+        if not new_product_id:
+            quarantine_rows.append(_product_id_quarantine_row(row, "missing_live_storefeeder_sku"))
+            keep_mask.loc[index] = False
+            continue
+        if old_product_id != new_product_id:
+            reconciliation_rows.append(
+                {
+                    "SKU": sku,
+                    "SupplierSKU": str(row.get("SupplierSKU", "")).strip(),
+                    "supplier": str(row.get("supplier", "")).strip(),
+                    "stock_strategy": str(row.get("stock_strategy", "")).strip(),
+                    "old_ProductID": old_product_id,
+                    "new_ProductID": new_product_id,
+                    "reason": "exact_unique_live_sku_productid_changed",
+                }
+            )
+            reconciled.at[index, "ProductID"] = new_product_id
+
+    return (
+        pd.DataFrame(reconciliation_rows, columns=PRODUCT_ID_RECONCILIATION_COLUMNS),
+        pd.DataFrame(quarantine_rows, columns=PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS),
+        reconciled[keep_mask].reset_index(drop=True),
+    )
+
+
+def _product_id_quarantine_row(row: pd.Series, reason: str) -> dict[str, str]:
+    return {
+        "SKU": str(row.get("SKU", "")).strip(),
+        "SupplierSKU": str(row.get("SupplierSKU", "")).strip(),
+        "supplier": str(row.get("supplier", "")).strip(),
+        "stock_strategy": str(row.get("stock_strategy", "")).strip(),
+        "ProductID": str(row.get("ProductID", "")).strip(),
+        "reason": reason,
+    }
+
+
+def _backup_and_write_targets(target_path: Path, targets: pd.DataFrame, run_id: str) -> None:
+    backup_path = target_path.with_name(f"{target_path.stem}.backup_{run_id}{target_path.suffix}")
+    shutil.copy2(target_path, backup_path)
+    targets.to_csv(target_path, index=False)
 
 
 def build_fast_payload_preview(
@@ -457,28 +649,76 @@ def _default_clear_stock_locations(supplier: str) -> str:
 def _stock_location_payload_preview(valid: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, row in valid.iterrows():
+        product_id = str(row["ProductID"]).strip()
         sku = str(row["SKU"]).strip()
         supplier = str(row["supplier"]).strip()
         supplier_sku = str(row["SupplierSKU"]).strip()
+        supplier_id = str(row["SupplierID"]).strip()
+        stock_strategy = str(row.get("stock_strategy", "")).strip()
+        skip_stock_location_update = str(row.get("skip_stock_location_update", "")).strip()
+        allow_stock_location_update = str(row.get("allow_stock_location_update", "")).strip()
         target_location = str(row["inventory_stock_location"]).strip()
         quantity = int(row["quantity"])
         if str(row.get("_stock_location_skip_reason", "")).strip():
             continue
         if target_location:
-            rows.append(_stock_location_payload_row(sku, supplier, supplier_sku, target_location, quantity))
+            rows.append(
+                _stock_location_payload_row(
+                    product_id,
+                    sku,
+                    supplier,
+                    supplier_id,
+                    supplier_sku,
+                    stock_strategy,
+                    skip_stock_location_update,
+                    allow_stock_location_update,
+                    target_location,
+                    quantity,
+                )
+            )
         for clear_location in _pipe_values(row["clear_stock_locations"]):
             if clear_location.casefold() == target_location.casefold():
                 continue
-            rows.append(_stock_location_payload_row(sku, supplier, supplier_sku, clear_location, 0))
+            rows.append(
+                _stock_location_payload_row(
+                    product_id,
+                    sku,
+                    supplier,
+                    supplier_id,
+                    supplier_sku,
+                    stock_strategy,
+                    skip_stock_location_update,
+                    allow_stock_location_update,
+                    clear_location,
+                    0,
+                )
+            )
     return pd.DataFrame(rows, columns=STOCK_LOCATION_PAYLOAD_COLUMNS)
 
 
-def _stock_location_payload_row(sku: str, supplier: str, supplier_sku: str, stock_location: str, quantity: int) -> dict[str, Any]:
+def _stock_location_payload_row(
+    product_id: str,
+    sku: str,
+    supplier: str,
+    supplier_id: str,
+    supplier_sku: str,
+    stock_strategy: str,
+    skip_stock_location_update: str,
+    allow_stock_location_update: str,
+    stock_location: str,
+    quantity: int,
+) -> dict[str, Any]:
     return {
+        "ProductID": product_id,
         "SKU": sku,
+        "SupplierSKU": supplier_sku,
         "supplier": supplier,
+        "supplier_id": supplier_id,
         "supplier_sku": supplier_sku,
         "stock_location": stock_location,
+        "stock_strategy": stock_strategy,
+        "skip_stock_location_update": skip_stock_location_update,
+        "allow_stock_location_update": allow_stock_location_update,
         "quantity": int(quantity),
         "confidence_status": "update_ready",
         "ProductIDType.IDType": "SKU",
@@ -538,6 +778,8 @@ def _zero_other_locations_preview(valid: pd.DataFrame) -> tuple[pd.DataFrame, pd
                 {
                     "SKU": sku,
                     "ProductID": product_id,
+                    "SupplierSKU": str(row.get("SupplierSKU", "")).strip(),
+                    "supplier": str(row.get("supplier", "")).strip(),
                     "stock_strategy": "supplier_synced_inventory",
                     "keep_stock_location": keep_location,
                     "zero_stock_location": zero_location,
@@ -581,10 +823,16 @@ def _zero_preview_to_stock_location_payload(zero_preview: pd.DataFrame) -> pd.Da
         return pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS)
     rows = pd.DataFrame(
         {
+            "ProductID": zero_preview.get("ProductID", ""),
             "SKU": zero_preview["SKU"],
-            "supplier": "",
-            "supplier_sku": "",
+            "SupplierSKU": zero_preview.get("SupplierSKU", ""),
+            "supplier": zero_preview.get("supplier", ""),
+            "supplier_id": "",
+            "supplier_sku": zero_preview.get("SupplierSKU", ""),
             "stock_location": zero_preview["zero_stock_location"],
+            "stock_strategy": zero_preview.get("stock_strategy", ""),
+            "skip_stock_location_update": "",
+            "allow_stock_location_update": "",
             "quantity": zero_preview["new_quantity"].astype(int),
             "confidence_status": "update_ready",
             "ProductIDType.IDType": "SKU",
@@ -625,12 +873,17 @@ def _send_fast_stock_batches(client: StoreFeederApiClient, batches: list[list[di
         "fast_stock_update_failures": out_dir / "fast_stock_update_failures.csv",
         "fast_stock_update_batches": out_dir / "fast_stock_update_batches.csv",
         "fast_stock_update_raw_responses": out_dir / "fast_stock_update_raw_responses.json",
+        "fast_stock_supplier_update_retry_success": out_dir / "fast_stock_supplier_update_retry_success.csv",
+        "fast_stock_supplier_update_retry_failures": out_dir / "fast_stock_supplier_update_retry_failures.csv",
+        "fast_stock_supplier_missing_product_supplier_recovered": out_dir / "fast_stock_supplier_missing_product_supplier_recovered.csv",
     }
     success_rows = []
-    failure_rows = []
+    initial_failure_rows = []
+    retry_success_rows = []
+    retry_failure_rows = []
     batch_rows = []
     raw_responses = []
-    report_columns = ["batch_number", "status_code", "ProductID", "SupplierID", "Supplier.Name", "SupplierSKU", "SupplierStockLevel", "SupplierCosts"]
+    report_columns = ["batch_number", "status_code", "ProductID", "SupplierID", "Supplier.Name", "SupplierSKU", "SupplierStockLevel", "SupplierCosts", "success", "error"]
     for batch_number, batch in enumerate(batches, start=1):
         result = client.update_product_supplier_inventory_cost(batch, batch_number=batch_number)
         batch_rows.append(
@@ -641,19 +894,70 @@ def _send_fast_stock_batches(client: StoreFeederApiClient, batches: list[list[di
                 "total_processed": result.total_processed,
                 "successful": result.successful,
                 "failed": result.failed,
+                "retry": "no",
             }
         )
         raw_responses.append({"batch_number": result.batch_number, "status_code": result.status_code, "response": result.response_json})
-        target_rows = failure_rows if result.status_code >= 400 or result.failed else success_rows
-        for item in batch:
-            target_rows.append(_supplier_item_report_row(batch_number, item, result.status_code))
+        failed_items = _append_supplier_response_rows(success_rows, initial_failure_rows, batch_number, batch, result.status_code, result.response_json)
+        for retry_index, item in enumerate(failed_items, start=1):
+            retry_batch_number = (batch_number * 1000) + retry_index
+            retry_result = client.update_product_supplier_inventory_cost([item], batch_number=retry_batch_number)
+            batch_rows.append(
+                {
+                    "batch_number": retry_result.batch_number,
+                    "requested_count": retry_result.requested_count,
+                    "status_code": retry_result.status_code,
+                    "total_processed": retry_result.total_processed,
+                    "successful": retry_result.successful,
+                    "failed": retry_result.failed,
+                    "retry": "individual",
+                }
+            )
+            raw_responses.append({"batch_number": retry_result.batch_number, "status_code": retry_result.status_code, "response": retry_result.response_json})
+            _append_supplier_response_rows(retry_success_rows, retry_failure_rows, retry_batch_number, [item], retry_result.status_code, retry_result.response_json)
 
+    final_failure_rows = retry_failure_rows if retry_failure_rows else initial_failure_rows
     pd.DataFrame(success_rows, columns=report_columns).to_csv(paths["fast_stock_update_success"], index=False)
-    pd.DataFrame(failure_rows, columns=report_columns).to_csv(paths["fast_stock_update_failures"], index=False)
+    pd.DataFrame(final_failure_rows, columns=report_columns).to_csv(paths["fast_stock_update_failures"], index=False)
+    pd.DataFrame(retry_success_rows, columns=report_columns).to_csv(paths["fast_stock_supplier_update_retry_success"], index=False)
+    pd.DataFrame(retry_failure_rows, columns=report_columns).to_csv(paths["fast_stock_supplier_update_retry_failures"], index=False)
+    pd.DataFrame(columns=report_columns).to_csv(paths["fast_stock_supplier_missing_product_supplier_recovered"], index=False)
     pd.DataFrame(batch_rows).to_csv(paths["fast_stock_update_batches"], index=False)
     paths["fast_stock_update_raw_responses"].write_text(json.dumps(raw_responses, indent=2), encoding="utf-8")
     return paths
 
+
+def _append_supplier_response_rows(
+    success_rows: list[dict[str, Any]],
+    failure_rows: list[dict[str, Any]],
+    batch_number: int,
+    batch: list[dict[str, Any]],
+    status_code: int,
+    response_json: dict[str, Any],
+) -> list[dict[str, Any]]:
+    failed_items: list[dict[str, Any]] = []
+    responses = response_json.get("Responses")
+    if not isinstance(responses, list) or len(responses) != len(batch):
+        batch_success = status_code < 400 and not _response_failed(response_json)
+        target_rows = success_rows if batch_success else failure_rows
+        error = "" if batch_success else _response_error(response_json)
+        for item in batch:
+            target_rows.append(_supplier_item_report_row(batch_number, item, status_code, success=batch_success, error=error))
+            if not batch_success:
+                failed_items.append(item)
+        return failed_items
+    for item, item_response in zip(batch, responses):
+        if isinstance(item_response, dict):
+            success = _truthy(item_response.get("Success"))
+            error = _response_error(item_response)
+        else:
+            success = False
+            error = str(item_response)
+        target_rows = success_rows if success else failure_rows
+        target_rows.append(_supplier_item_report_row(batch_number, item, status_code, success=success, error=error))
+        if not success:
+            failed_items.append(item)
+    return failed_items
 
 def _send_fast_stock_location_batches(
     client: StoreFeederApiClient,
@@ -661,6 +965,7 @@ def _send_fast_stock_location_batches(
     out_dir: Path,
     *,
     file_prefix: str = "fast_stock_location_update",
+    source_preview: pd.DataFrame | None = None,
 ) -> tuple[dict[str, Path], int]:
     paths = {
         f"{file_prefix}_success": out_dir / f"{file_prefix}_success.csv",
@@ -676,7 +981,14 @@ def _send_fast_stock_location_batches(
     report_columns = [
         "batch_number",
         "status_code",
+        "ProductID",
         "SKU",
+        "SupplierSKU",
+        "supplier",
+        "supplier_id",
+        "stock_strategy",
+        "skip_stock_location_update",
+        "allow_stock_location_update",
         "stock_location_id_type",
         "stock_location_id_value",
         "adjustment_type",
@@ -684,6 +996,7 @@ def _send_fast_stock_location_batches(
         "success",
         "error",
     ]
+    metadata = _stock_location_metadata(source_preview)
     for batch_number, batch in enumerate(batches, start=1):
         attempt = 0
         while True:
@@ -722,6 +1035,7 @@ def _send_fast_stock_location_batches(
             batch,
             result.status_code,
             result.response_json,
+            metadata,
         )
 
     pd.DataFrame(success_rows, columns=report_columns).to_csv(paths[f"{file_prefix}_success"], index=False)
@@ -731,7 +1045,7 @@ def _send_fast_stock_location_batches(
     return paths, retry_count
 
 
-def _supplier_item_report_row(batch_number: int, item: dict[str, Any], status_code: int) -> dict[str, Any]:
+def _supplier_item_report_row(batch_number: int, item: dict[str, Any], status_code: int, *, success: bool, error: str) -> dict[str, Any]:
     return {
         "batch_number": batch_number,
         "status_code": status_code,
@@ -741,6 +1055,8 @@ def _supplier_item_report_row(batch_number: int, item: dict[str, Any], status_co
         "SupplierSKU": item["SupplierSKU"],
         "SupplierStockLevel": item["SupplierStockLevel"],
         "SupplierCosts": item["SupplierCosts"],
+        "success": "yes" if success else "no",
+        "error": error,
     }
 
 
@@ -751,6 +1067,7 @@ def _append_stock_location_response_rows(
     batch: list[dict[str, Any]],
     status_code: int,
     response_json: dict[str, Any],
+    metadata: dict[tuple[str, str, int], dict[str, Any]] | None = None,
 ) -> None:
     responses = response_json.get("Responses")
     if not isinstance(responses, list) or len(responses) != len(batch):
@@ -764,6 +1081,7 @@ def _append_stock_location_response_rows(
                     status_code,
                     success=batch_success,
                     error=_response_error(response_json) if not batch_success else "",
+                    metadata=metadata,
                 )
             )
         return
@@ -776,7 +1094,7 @@ def _append_stock_location_response_rows(
             success = _truthy(item_response.get("Success"))
             error = _response_error(item_response)
         target_rows = success_rows if success else failure_rows
-        target_rows.append(_stock_location_item_report_row(batch_number, item, status_code, success=success, error=error))
+        target_rows.append(_stock_location_item_report_row(batch_number, item, status_code, success=success, error=error, metadata=metadata))
 
 
 def _stock_location_item_report_row(
@@ -786,11 +1104,20 @@ def _stock_location_item_report_row(
     *,
     success: bool,
     error: str,
+    metadata: dict[tuple[str, str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    meta = _stock_location_item_metadata(item, metadata)
     return {
         "batch_number": batch_number,
         "status_code": status_code,
+        "ProductID": meta.get("ProductID", ""),
         "SKU": item["ProductIDType"]["Value"],
+        "SupplierSKU": meta.get("SupplierSKU", ""),
+        "supplier": meta.get("supplier", ""),
+        "supplier_id": meta.get("supplier_id", ""),
+        "stock_strategy": meta.get("stock_strategy", ""),
+        "skip_stock_location_update": meta.get("skip_stock_location_update", ""),
+        "allow_stock_location_update": meta.get("allow_stock_location_update", ""),
         "stock_location_id_type": item["StockLocationID"]["IDType"],
         "stock_location_id_value": item["StockLocationID"]["Value"],
         "adjustment_type": item["AdjustmentType"],
@@ -798,6 +1125,44 @@ def _stock_location_item_report_row(
         "success": "yes" if success else "no",
         "error": error,
     }
+
+
+def _stock_location_metadata(preview: pd.DataFrame | None) -> dict[tuple[str, str, int], dict[str, Any]]:
+    if preview is None or preview.empty:
+        return {}
+    rows: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for _, row in preview.iterrows():
+        sku = str(row.get("ProductIDType.Value", row.get("SKU", ""))).strip()
+        location = str(row.get("StockLocationID.Value", row.get("stock_location", ""))).strip()
+        try:
+            amount = int(row.get("AdjustmentAmount", row.get("quantity", 0)))
+        except (TypeError, ValueError):
+            amount = 0
+        rows[(sku.casefold(), location.casefold(), amount)] = {
+            "ProductID": str(row.get("ProductID", "")).strip(),
+            "SupplierSKU": str(row.get("SupplierSKU", row.get("supplier_sku", ""))).strip(),
+            "supplier": str(row.get("supplier", "")).strip(),
+            "supplier_id": str(row.get("supplier_id", row.get("SupplierID", ""))).strip(),
+            "stock_strategy": str(row.get("stock_strategy", "")).strip(),
+            "skip_stock_location_update": str(row.get("skip_stock_location_update", "")).strip(),
+            "allow_stock_location_update": str(row.get("allow_stock_location_update", "")).strip(),
+        }
+    return rows
+
+
+def _stock_location_item_metadata(item: dict[str, Any], metadata: dict[tuple[str, str, int], dict[str, Any]] | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    try:
+        amount = int(item.get("AdjustmentAmount", 0))
+    except (TypeError, ValueError):
+        amount = 0
+    key = (
+        str(item.get("ProductIDType", {}).get("Value", "")).strip().casefold(),
+        str(item.get("StockLocationID", {}).get("Value", "")).strip().casefold(),
+        amount,
+    )
+    return metadata.get(key, {})
 
 
 def _response_failed(response_json: dict[str, Any]) -> bool:
@@ -850,18 +1215,42 @@ def _summary_frame(
     supplier_info_only_preview: pd.DataFrame | None = None,
     zero_other_locations_success: int = 0,
     zero_other_locations_failures: int = 0,
+    supplier_update_initial_failures: int = 0,
+    supplier_update_retry_success: int = 0,
+    supplier_update_retry_failures: int = 0,
+    supplier_update_missing_product_supplier_recovered: int = 0,
+    supplier_update_persistent_failures: int = 0,
+    supplier_info_only_supplier_update_success: int = 0,
+    supplier_info_only_supplier_update_failures: int = 0,
+    current_target_rows: int | None = None,
+    target_file_mtime: str = "",
+    scheduled_run: bool = False,
+    product_id_reconciliation: pd.DataFrame | None = None,
+    product_id_quarantine: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     channel_safety_skips = channel_safety_skips if channel_safety_skips is not None else pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
     zero_location_preview = zero_location_preview if zero_location_preview is not None else pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
     zero_location_safety_skips = zero_location_safety_skips if zero_location_safety_skips is not None else pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
     supplier_info_only_preview = supplier_info_only_preview if supplier_info_only_preview is not None else pd.DataFrame(columns=PAYLOAD_COLUMNS)
+    product_id_reconciliation = product_id_reconciliation if product_id_reconciliation is not None else pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_COLUMNS)
+    product_id_quarantine = product_id_quarantine if product_id_quarantine is not None else pd.DataFrame(columns=PRODUCT_ID_RECONCILIATION_QUARANTINE_COLUMNS)
     return pd.DataFrame(
         [
             {"metric": "dry_run", "value": "no" if live else "yes"},
             {"metric": "target_rows", "value": len(targets)},
+            {"metric": "current_target_rows", "value": current_target_rows if current_target_rows is not None else len(targets)},
+            {"metric": "target_rows_loaded_this_run", "value": len(targets)},
+            {"metric": "target_file_mtime", "value": target_file_mtime},
+            {"metric": "scheduled_run", "value": "yes" if scheduled_run else "no"},
             {"metric": "supplier_payload_rows", "value": len(preview)},
+            {"metric": "runtime_product_id_reconciliations", "value": len(product_id_reconciliation)},
+            {"metric": "runtime_product_id_quarantine_rows", "value": len(product_id_quarantine)},
+            {"metric": "supplier_info_only_target_rows", "value": _supplier_info_only_target_count(targets)},
             {"metric": "supplier_info_only_rows", "value": len(supplier_info_only_preview)},
+            {"metric": "supplier_info_only_payload_rows", "value": len(supplier_info_only_preview)},
             {"metric": "supplier_info_only_supplier_updates", "value": len(supplier_info_only_preview)},
+            {"metric": "supplier_info_only_supplier_update_success", "value": supplier_info_only_supplier_update_success},
+            {"metric": "supplier_info_only_supplier_update_failures", "value": supplier_info_only_supplier_update_failures},
             {"metric": "supplier_info_only_inventory_skips", "value": len(supplier_info_only_preview)},
             {"metric": "stock_location_payload_rows", "value": len(stock_location_preview)},
             {"metric": "zero_other_locations_payload_rows", "value": len(zero_location_preview)},
@@ -875,6 +1264,11 @@ def _summary_frame(
             {"metric": "explicit_stock_location_allowed_rows", "value": _explicit_stock_location_allowed_count(targets)},
             {"metric": "supplier_update_success", "value": supplier_update_success},
             {"metric": "supplier_update_failures", "value": supplier_update_failures},
+            {"metric": "supplier_update_initial_failures", "value": supplier_update_initial_failures},
+            {"metric": "supplier_update_retry_success", "value": supplier_update_retry_success},
+            {"metric": "supplier_update_retry_failures", "value": supplier_update_retry_failures},
+            {"metric": "supplier_update_missing_product_supplier_recovered", "value": supplier_update_missing_product_supplier_recovered},
+            {"metric": "supplier_update_persistent_failures", "value": supplier_update_persistent_failures},
             {"metric": "stock_location_update_success", "value": stock_location_update_success},
             {"metric": "stock_location_update_failures", "value": stock_location_update_failures},
             {"metric": "zero_other_locations_success", "value": zero_other_locations_success},
@@ -883,6 +1277,52 @@ def _summary_frame(
             {"metric": "live_stock_update", "value": "yes" if live else "no"},
         ]
     )
+
+
+def _stale_fast_sync_guard(target_path: Path, current_target_rows: int, loaded_target_rows: int, target_file_mtime: str, scheduled_run: bool) -> pd.DataFrame:
+    rows = [
+        {"metric": "current_target_rows", "value": current_target_rows},
+        {"metric": "target_rows_loaded_this_run", "value": loaded_target_rows},
+        {"metric": "target_file_mtime", "value": target_file_mtime},
+        {"metric": "scheduled_run", "value": "yes" if scheduled_run else "no"},
+        {"metric": "row_count_match", "value": "yes" if current_target_rows == loaded_target_rows else "no"},
+        {"metric": "target_file", "value": str(target_path)},
+    ]
+    stale = False
+    if scheduled_run:
+        latest_onboarding = _latest_report_file(Path("reports/new_product_onboarding_delta"), "onboarding_summary.csv")
+        latest_fast = _latest_report_file(Path("reports/scheduled_fast_stock_sync"), "fast_stock_summary.csv")
+        latest_onboarding_mtime = _file_mtime(latest_onboarding) if latest_onboarding else ""
+        latest_fast_mtime = _file_mtime(latest_fast) if latest_fast else ""
+        if latest_onboarding and latest_fast and latest_onboarding.stat().st_mtime > latest_fast.stat().st_mtime:
+            stale = True
+        if latest_fast and target_path.exists() and target_path.stat().st_mtime > latest_fast.stat().st_mtime:
+            stale = True
+        rows.extend(
+            [
+                {"metric": "latest_onboarding_summary", "value": str(latest_onboarding or "")},
+                {"metric": "latest_onboarding_summary_mtime", "value": latest_onboarding_mtime},
+                {"metric": "latest_fast_summary", "value": str(latest_fast or "")},
+                {"metric": "latest_fast_summary_mtime", "value": latest_fast_mtime},
+                {"metric": "stale_fast_sync_detected", "value": "yes" if stale else "no"},
+            ]
+        )
+    else:
+        rows.append({"metric": "stale_fast_sync_detected", "value": "no"})
+    return pd.DataFrame(rows)
+
+
+def _latest_report_file(root: Path, filename: str) -> Path | None:
+    if not root.exists():
+        return None
+    files = [path / filename for path in root.iterdir() if path.is_dir() and (path / filename).exists()]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
+
+
+def _file_mtime(path: Path | None) -> str:
+    if not path or not path.exists():
+        return ""
+    return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
 
 
 def _require_columns(df: pd.DataFrame, columns: list[str], label: str) -> None:
@@ -898,6 +1338,14 @@ def _channel_decorated_count(targets: pd.DataFrame) -> int:
         targets["SKU"].fillna("").astype(str).str.strip().str.casefold().ne(
             targets["SupplierSKU"].fillna("").astype(str).str.strip().str.casefold()
         ).sum()
+    )
+
+
+def _supplier_info_only_target_count(targets: pd.DataFrame) -> int:
+    if "stock_strategy" not in targets.columns:
+        return 0
+    return int(
+        targets["stock_strategy"].fillna("").astype(str).str.strip().str.casefold().eq("supplier_info_only_manual_inventory").sum()
     )
 
 
@@ -928,6 +1376,114 @@ def _csv_count(path: Path) -> int:
         return 0
 
 
+def _supplier_info_only_update_count(report_path: Path, supplier_info_only_preview: pd.DataFrame) -> int:
+    if supplier_info_only_preview.empty or not report_path.exists():
+        return 0
+    try:
+        report = pd.read_csv(report_path, dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        return 0
+    if report.empty:
+        return 0
+    keys = set(
+        zip(
+            supplier_info_only_preview["ProductID"].astype(str).str.strip(),
+            supplier_info_only_preview["SupplierSKU"].astype(str).str.strip().str.casefold(),
+        )
+    )
+    if not keys:
+        return 0
+    return int(
+        report.apply(
+            lambda row: (
+                str(row.get("ProductID", "")).strip(),
+                str(row.get("SupplierSKU", "")).strip().casefold(),
+            )
+            in keys,
+            axis=1,
+        ).sum()
+    )
+
+
+def _verify_live_sample(client: StoreFeederApiClient, stock_location_preview: pd.DataFrame, sample_size: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = ["ProductID", "SKU", "stock_location", "intended_quantity", "live_quantity", "verification_status", "reason"]
+    if stock_location_preview.empty or sample_size <= 0:
+        empty = pd.DataFrame(columns=columns)
+        return empty, empty.copy()
+    sample = stock_location_preview.drop_duplicates(subset=["ProductID", "SKU", "stock_location"]).head(sample_size).copy()
+    rows: list[dict[str, Any]] = []
+    for _, row in sample.iterrows():
+        product_id = str(row.get("ProductID", "")).strip()
+        sku = str(row.get("SKU", "")).strip()
+        location = str(row.get("stock_location", "")).strip()
+        intended = str(row.get("quantity", "")).strip()
+        live_quantity = ""
+        status = "not_verified"
+        reason = ""
+        if not product_id:
+            reason = "missing_product_id"
+        else:
+            try:
+                wrapper = client.get_product(product_id)
+                if int(wrapper.get("_status_code", 0)) >= 400:
+                    reason = f"GET product failed: {wrapper.get('_status_code')}"
+                else:
+                    live_quantity = _live_stock_location_quantity(wrapper.get("response", {}), location)
+                    if live_quantity == "":
+                        status = "failed"
+                        reason = "stock_location_not_present_in_live_readback"
+                    elif str(live_quantity).strip() == intended:
+                        status = "verified"
+                        reason = "live quantity matches intended quantity"
+                    else:
+                        status = "failed"
+                        reason = "live quantity differs from intended quantity"
+            except Exception as exc:
+                status = "failed"
+                reason = str(exc)
+        rows.append(
+            {
+                "ProductID": product_id,
+                "SKU": sku,
+                "stock_location": location,
+                "intended_quantity": intended,
+                "live_quantity": live_quantity,
+                "verification_status": status,
+                "reason": reason,
+            }
+        )
+    sample_report = pd.DataFrame(rows, columns=columns)
+    failures = sample_report[sample_report["verification_status"].ne("verified")].copy()
+    return sample_report, failures
+
+
+def _live_stock_location_quantity(payload: Any, location: str) -> str:
+    if not isinstance(payload, dict) or not location:
+        return ""
+    records: list[dict[str, Any]] = []
+    for container in [payload.get("WarehouseInformation"), payload.get("warehouseInformation"), payload]:
+        if not isinstance(container, dict):
+            continue
+        for key in ["StockLocations", "stockLocations", "Locations", "locations"]:
+            value = container.get(key)
+            if isinstance(value, list):
+                records.extend([item for item in value if isinstance(item, dict)])
+    for record in records:
+        name = str(
+            record.get("StockLocationReference")
+            or record.get("Reference")
+            or record.get("Name")
+            or record.get("StockLocation", {}).get("Name", "") if isinstance(record.get("StockLocation"), dict) else ""
+        ).strip()
+        if name.casefold() != location.casefold():
+            continue
+        for key in ["CurrentInventory", "Inventory", "Quantity", "Available", "Stock"]:
+            value = record.get(key)
+            if value not in [None, ""]:
+                return str(value).strip()
+    return ""
+
+
 def _run(command: list[str], label: str) -> None:
     print(f"\n== {label} ==")
     print(" ".join(command))
@@ -948,5 +1504,50 @@ def _load_env_file(path: Path) -> None:
             os.environ[name] = value
 
 
+def _out_dir_from_argv(argv: list[str]) -> Path:
+    for index, value in enumerate(argv):
+        if value == "--out-dir" and index + 1 < len(argv):
+            return Path(argv[index + 1])
+        if value.startswith("--out-dir="):
+            return Path(value.split("=", 1)[1])
+    return Path("reports/fast_stock_updates") / datetime.now().strftime("%Y%m%d_%H%M%S_exception")
+
+
+def _write_exception_artifacts(out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    traceback_path = out_dir / "exception_traceback.txt"
+    traceback_path.write_text(traceback.format_exc(), encoding="utf-8")
+    summary_path = out_dir / "fast_stock_summary.csv"
+    exception_rows = pd.DataFrame(
+        [
+            {"metric": "wrapper_failed", "value": "yes"},
+            {"metric": "python_failed", "value": "yes"},
+            {"metric": "failure_stage", "value": "python_exception"},
+            {"metric": "exception_traceback_path", "value": str(traceback_path)},
+            {"metric": "live_stock_update", "value": "unknown"},
+        ]
+    )
+    if summary_path.exists():
+        try:
+            existing = pd.read_csv(summary_path, dtype=str, keep_default_na=False)
+        except Exception:
+            existing = pd.DataFrame(columns=["metric", "value"])
+        if {"metric", "value"}.issubset(existing.columns):
+            existing = existing[~existing["metric"].isin(exception_rows["metric"])].copy()
+            summary = pd.concat([existing[["metric", "value"]], exception_rows], ignore_index=True)
+        else:
+            summary = exception_rows
+    else:
+        summary = exception_rows
+    summary.to_csv(summary_path, index=False)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit as exc:
+        raise exc
+    except Exception:
+        _write_exception_artifacts(_out_dir_from_argv(sys.argv[1:]))
+        raise
+

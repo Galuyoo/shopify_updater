@@ -32,6 +32,24 @@ from src.storefeeder_stock_export import read_csv
 SUMMARY_COLUMNS = ["metric", "value"]
 PROTECTED_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "matched_rule", "stock_update_mode", "reason", "state_action"]
 SUPPLIER_INFO_ONLY_COLUMNS = ["ProductID", "SKU", "Parent SKU", "Name", "matched_rule", "supplier", "SupplierID", "Supplier.Name", "SupplierSKU", "supplier_free_stock", "product_supplier_status", "target_action", "reason"]
+SUPPLIER_INFO_ONLY_COLUMNS = [
+    "ProductID",
+    "SKU",
+    "Parent SKU",
+    "Name",
+    "matched_rule",
+    "supplier",
+    "SupplierID",
+    "Supplier.Name",
+    "SupplierSKU",
+    "supplier_free_stock",
+    "product_supplier_status",
+    "target_action",
+    "reason",
+    "selected_source",
+    "success_state_bypassed",
+    "bypass_reason",
+]
 PARENT_COLUMNS = ["ProductID", "SKU", "Name", "classification", "family_signature", "child_count", "state_action", "reason"]
 QUARANTINE_COLUMNS = [
     "ProductID",
@@ -81,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uneek-stock", type=Path, default=Path("data/Uneek_stock_levels.csv"))
     parser.add_argument("--warehouse-only-rules", type=Path, default=Path("data/warehouse_only_prime_sku_rules.csv"))
     parser.add_argument("--prime-parent-registry", type=Path, default=Path("data/amazon_prime_parent_skus.csv"))
+    parser.add_argument("--supplier-info-only-sku-map", type=Path, default=Path("data/supplier_info_only_sku_map.csv"))
     parser.add_argument("--out-root", type=Path, default=Path("reports/new_product_onboarding_delta"))
     parser.add_argument("--catalogue-snapshot-dir", type=Path, default=Path("data/storefeeder_catalogue_snapshots"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -131,6 +150,7 @@ def main() -> int:
     targets = _read_targets(args.target_file)
     supplier_ids = _load_supplier_ids(args.supplier_id_map)
     supplier_stock = build_supplier_stock_lookup(read_csv(args.ralawise_stock), read_csv(args.uneek_stock))
+    supplier_info_only_map = _load_supplier_info_only_map(args.supplier_info_only_sku_map)
     warehouse_rules = _load_protection_rules(args.warehouse_only_rules, args.prime_parent_registry)
     state = _read_state(args.state_file)
 
@@ -140,6 +160,7 @@ def main() -> int:
         targets=targets,
         supplier_ids=supplier_ids,
         supplier_stock=supplier_stock,
+        supplier_info_only_map=supplier_info_only_map,
         warehouse_rules=warehouse_rules,
         state=state,
         execute=args.execute,
@@ -176,6 +197,7 @@ def main() -> int:
     summary = _replace_summary_metric(summary, "target_rows_appended", appended_count)
     if args.execute:
         summary = _replace_summary_metric(summary, "target_gap_rows_appended", result.get("target_gap_rows_ready", 0) if appended_count else 0)
+        summary = _replace_summary_metric(summary, "post_onboarding_target_rows_appended", appended_count)
     summary = _replace_summary_metric(summary, "execute_mode", "yes" if args.execute else "no")
     summary = _replace_summary_metric(summary, "create_missing_product_suppliers", "yes" if args.create_missing_product_suppliers else "no")
 
@@ -188,16 +210,22 @@ def main() -> int:
         "changed_parent_families_detected": out_dir / "changed_parent_families_detected.csv",
         "new_children_detected": out_dir / "new_children_detected.csv",
         "recovered_target_gaps": out_dir / "recovered_target_gaps.csv",
+        "post_onboarding_live_target_gaps": out_dir / "post_onboarding_live_target_gaps.csv",
+        "product_supplier_exists_but_target_missing": out_dir / "product_supplier_exists_but_target_missing.csv",
         "recovered_missing_product_suppliers": out_dir / "recovered_missing_product_suppliers.csv",
         "pending_retry_processed": out_dir / "pending_retry_processed.csv",
         "promoted_supplier_synced": out_dir / "promoted_supplier_synced.csv",
         "protected_warehouse_only": out_dir / "protected_warehouse_only.csv",
         "protected_manual_inventory_supplier_info_only": out_dir / "protected_manual_inventory_supplier_info_only.csv",
+        "supplier_info_only_targets_ready": out_dir / "supplier_info_only_targets_ready.csv",
+        "supplier_info_only_targets_appended": out_dir / "supplier_info_only_targets_appended.csv",
+        "supplier_info_only_mapping_quarantine": out_dir / "supplier_info_only_mapping_quarantine.csv",
         "parent_aggregates": out_dir / "parent_aggregates.csv",
         "quarantine": out_dir / "quarantine.csv",
         "product_supplier_setup_success": out_dir / "product_supplier_setup_success.csv",
         "product_supplier_setup_failures": out_dir / "product_supplier_setup_failures.csv",
         "target_rows_appended": out_dir / "target_rows_appended.csv",
+        "post_onboarding_target_rows_appended": out_dir / "post_onboarding_target_rows_appended.csv",
     }
     summary.to_csv(paths["onboarding_summary"], index=False)
     current_catalogue.to_csv(paths["current_catalogue_snapshot"], index=False)
@@ -207,16 +235,24 @@ def main() -> int:
     changed_parent_families.to_csv(paths["changed_parent_families_detected"], index=False)
     new_children.to_csv(paths["new_children_detected"], index=False)
     result["target_gaps"].to_csv(paths["recovered_target_gaps"], index=False)
+    result["target_gaps"].to_csv(paths["post_onboarding_live_target_gaps"], index=False)
+    result["product_supplier_exists_but_target_missing"].to_csv(paths["product_supplier_exists_but_target_missing"], index=False)
     result["missing_product_suppliers"].to_csv(paths["recovered_missing_product_suppliers"], index=False)
     result["pending_retry_processed"].to_csv(paths["pending_retry_processed"], index=False)
     promoted.to_csv(paths["promoted_supplier_synced"], index=False)
     protected.to_csv(paths["protected_warehouse_only"], index=False)
     result["supplier_info_only"].to_csv(paths["protected_manual_inventory_supplier_info_only"], index=False)
+    result["supplier_info_only_targets_ready"].to_csv(paths["supplier_info_only_targets_ready"], index=False)
+    result["supplier_info_only_mapping_quarantine"].to_csv(paths["supplier_info_only_mapping_quarantine"], index=False)
     parents.to_csv(paths["parent_aggregates"], index=False)
     quarantine.to_csv(paths["quarantine"], index=False)
     setup_success.to_csv(paths["product_supplier_setup_success"], index=False)
     setup_failures.to_csv(paths["product_supplier_setup_failures"], index=False)
     target_rows_appended.to_csv(paths["target_rows_appended"], index=False)
+    target_rows_appended.to_csv(paths["post_onboarding_target_rows_appended"], index=False)
+    target_rows_appended[
+        target_rows_appended.get("stock_strategy", pd.Series(dtype=str)).astype(str).str.casefold().eq("supplier_info_only_manual_inventory")
+    ].to_csv(paths["supplier_info_only_targets_appended"], index=False)
 
     print("StoreFeeder new product onboarding delta")
     print(summary.to_string(index=False))
@@ -239,6 +275,7 @@ def run_delta_onboarding(
     targets: pd.DataFrame,
     supplier_ids: pd.DataFrame,
     supplier_stock: pd.DataFrame,
+    supplier_info_only_map: pd.DataFrame,
     warehouse_rules: list[dict[str, str]],
     state: dict[str, Any],
     execute: bool,
@@ -259,12 +296,13 @@ def run_delta_onboarding(
     existing_skus = {value.casefold() for value in targets["SKU"].fillna("").astype(str).str.strip() if value}
     children_by_parent = _children_by_parent(products)
     parent_skus = set(children_by_parent.keys())
-    target_gaps = _target_gap_candidates(products, targets, supplier_ids, supplier_stock, warehouse_rules, children_by_parent)
+    target_gaps = _target_gap_candidates(products, targets, supplier_ids, supplier_stock, supplier_info_only_map, warehouse_rules, children_by_parent)
+    product_supplier_exists_but_target_missing = _product_supplier_exists_but_target_missing(client, target_gaps)
     state = _normalize_state(state)
     processed = state.setdefault("processed", {})
     pending = state.setdefault("pending", {})
     if use_catalogue_delta:
-        products, delta_stats = _filter_products_for_catalogue_delta(products, catalogue_delta, children_by_parent, pending, target_gaps)
+        products, delta_stats = _filter_products_for_catalogue_delta(products, catalogue_delta, children_by_parent, pending, target_gaps, supplier_info_only_map)
     else:
         delta_stats = {
             "catalogue_delta_enabled": "no",
@@ -276,6 +314,7 @@ def run_delta_onboarding(
             "catalogue_delta_new_numeric_parent_families": 0,
             "pending_retry_rows_selected": 0,
             "target_gap_rows_detected": len(target_gaps),
+            "supplier_info_only_mapping_candidates": len(supplier_info_only_map),
         }
 
     pending_retry_processed = _pending_retry_processed_report(products, pending)
@@ -293,7 +332,10 @@ def run_delta_onboarding(
     scanned_variants = 0
     skipped_existing = 0
     skipped_state = 0
+    supplier_info_only_success_state_bypassed = 0
+    supplier_info_only_skipped_existing_target_rows = 0
     processed_new = 0
+    live_sku_counts = products["SKU"].fillna("").astype(str).str.strip().str.casefold().value_counts().to_dict()
 
     for _, product in products.iterrows():
         product_id = str(product["ID"]).strip()
@@ -308,14 +350,13 @@ def run_delta_onboarding(
         state_key = _state_key(product_id, sku)
         product_state = processed.get(state_key, {})
 
-        if product_id in existing_product_ids or sku.casefold() in existing_skus:
-            skipped_existing += 1
-            if execute:
-                _clear_pending(pending, product_id, sku)
-            continue
-
         protection_rule = _match_protection_rule(sku, parent_sku, warehouse_rules)
-        if protection_rule and protection_rule.get("stock_update_mode") == "full_protect":
+        has_supplier_info_only_mapping = _supplier_info_only_map_has_sku(product, supplier_info_only_map)
+        supplier_info_only_mode = bool(
+            (protection_rule and protection_rule.get("stock_update_mode") == "supplier_info_only_manual_inventory")
+            or has_supplier_info_only_mapping
+        )
+        if protection_rule and protection_rule.get("stock_update_mode") == "full_protect" and not has_supplier_info_only_mapping:
             if not ignore_success_state and _state_success(product_state, "protected"):
                 skipped_state += 1
                 continue
@@ -335,7 +376,12 @@ def run_delta_onboarding(
                 _save_processed(processed, state_key, product_id, sku, "protected", row["reason"], run_id)
                 _clear_pending(pending, product_id, sku)
             continue
-        supplier_info_only_mode = bool(protection_rule and protection_rule.get("stock_update_mode") == "supplier_info_only_manual_inventory")
+
+        if not supplier_info_only_mode and (product_id in existing_product_ids or sku.casefold() in existing_skus):
+            skipped_existing += 1
+            if execute:
+                _clear_pending(pending, product_id, sku)
+            continue
 
         is_parent = sku.casefold() in parent_skus
         if is_parent:
@@ -363,26 +409,66 @@ def run_delta_onboarding(
             continue
 
         scanned_variants += 1
-        if not ignore_success_state and _state_success(product_state, "promoted"):
+        if not supplier_info_only_mode and not ignore_success_state and _state_success(product_state, "promoted"):
             skipped_state += 1
             continue
 
-        exact_matches = _exact_supplier_matches(sku, supplier_ids, supplier_stock)
+        if supplier_info_only_mode and int(live_sku_counts.get(sku.casefold(), 0)) > 1:
+            quarantine_rows.append(_quarantine_row(product, "duplicate_live_storefeeder_sku", "Supplier-info-only mapping requires exactly one live StoreFeeder child SKU"))
+            continue
+
+        exact_matches = _supplier_info_only_matches(product, protection_rule, supplier_info_only_map, supplier_stock) if supplier_info_only_mode else _exact_supplier_matches(sku, supplier_ids, supplier_stock)
         if len(exact_matches) == 0:
-            quarantine_rows.append(_quarantine_row(product, "no_exact_supplier_sku_match", "StoreFeeder SKU was not found exactly once in supplier feeds"))
+            reason = "No approved supplier-info-only mapping or supplier feed validation failed" if supplier_info_only_mode else "StoreFeeder SKU was not found exactly once in supplier feeds"
+            quarantine_rows.append(_quarantine_row(product, "no_supplier_info_only_mapping" if supplier_info_only_mode else "no_exact_supplier_sku_match", reason))
             continue
         if len(exact_matches) > 1:
             quarantine_rows.append(_quarantine_row(product, "ambiguous_exact_supplier_sku_match", "StoreFeeder SKU matched multiple supplier feeds or duplicate supplier rows"))
             continue
 
         candidate = exact_matches[0]
+        lane_state_key = _lane_state_key(product_id, sku, candidate, "supplier_info_only_manual_inventory" if supplier_info_only_mode else "supplier_synced_inventory")
+        lane_state = processed.get(lane_state_key, {})
+        supplier_info_only_target_exists = supplier_info_only_mode and _target_row_exists(
+            targets,
+            product_id=product_id,
+            sku=sku,
+            candidate=candidate,
+            stock_strategy="supplier_info_only_manual_inventory",
+        )
+        success_state_bypassed = "no"
+        bypass_reason = ""
+
+        if supplier_info_only_mode and supplier_info_only_target_exists:
+            supplier_info_only_skipped_existing_target_rows += 1
+            skipped_existing += 1
+            if execute:
+                _clear_pending(pending, product_id, sku)
+            continue
+        if supplier_info_only_mode and not ignore_success_state and _state_success(lane_state, "promoted") and supplier_info_only_target_exists:
+            skipped_state += 1
+            continue
+        if supplier_info_only_mode and not ignore_success_state and _state_success(product_state, "promoted") and not supplier_info_only_target_exists:
+            supplier_info_only_success_state_bypassed += 1
+            success_state_bypassed = "yes"
+            bypass_reason = "supplier_info_only_target_missing"
+
         already_attached = _product_has_supplier(client, product_id, candidate)
         setup_ok = already_attached
         setup_status = "already_attached" if already_attached else "missing_product_supplier_preview_only"
         if not already_attached:
             missing_product_supplier_rows.append(_missing_product_supplier_row(product, candidate, setup_status, "create_in_execute" if execute and create_missing_product_suppliers else "preview_only", "exact supplier match but ProductSupplier is missing"))
         if not already_attached and not execute:
-            preview_row = _supplier_info_only_row(product, protection_rule, candidate, setup_status, "preview_create_product_supplier_then_append_supplier_info_target", "supplier-info-only manual inventory lane; ProductSupplier missing and would be created in execute mode") if supplier_info_only_mode else _promoted_row(
+            preview_row = _supplier_info_only_row(
+                product,
+                protection_rule,
+                candidate,
+                setup_status,
+                "preview_create_product_supplier_then_append_supplier_info_target",
+                "supplier-info-only manual inventory lane; ProductSupplier missing and would be created in execute mode",
+                success_state_bypassed=success_state_bypassed,
+                bypass_reason=bypass_reason,
+            ) if supplier_info_only_mode else _promoted_row(
                 product,
                 candidate,
                 setup_status,
@@ -415,7 +501,18 @@ def run_delta_onboarding(
             if str(product.get("_work_source", "")).strip() == "target_gap_recovery":
                 target_gap_rows_ready += 1
             if supplier_info_only_mode:
-                supplier_info_only_rows.append(_supplier_info_only_row(product, protection_rule, candidate, setup_status, "append_supplier_info_only_target", "supplier-info-only manual inventory lane; append supplier payload target but skip all inventory/location updates"))
+                supplier_info_only_rows.append(
+                    _supplier_info_only_row(
+                        product,
+                        protection_rule,
+                        candidate,
+                        setup_status,
+                        "append_supplier_info_only_target",
+                        "supplier-info-only manual inventory lane; append supplier payload target but skip all inventory/location updates",
+                        success_state_bypassed=success_state_bypassed,
+                        bypass_reason=bypass_reason,
+                    )
+                )
             else:
                 promoted_rows.append(
                     _promoted_row(
@@ -428,7 +525,18 @@ def run_delta_onboarding(
                 )
             processed_new += 1
             if execute:
-                _save_processed(processed, state_key, product_id, sku, "promoted", "exact_unique_supplier_match_promoted", run_id)
+                _save_processed(
+                    processed,
+                    lane_state_key if supplier_info_only_mode else state_key,
+                    product_id,
+                    sku,
+                    "promoted",
+                    "supplier_info_only_manual_inventory_promoted" if supplier_info_only_mode else "exact_unique_supplier_match_promoted",
+                    run_id,
+                    supplier_sku=candidate.get("supplier_sku", ""),
+                    supplier_id=candidate.get("SupplierID", ""),
+                    stock_strategy="supplier_info_only_manual_inventory" if supplier_info_only_mode else "supplier_synced_inventory",
+                )
                 _clear_pending(pending, product_id, sku)
         else:
             quarantine_rows.append(_quarantine_row(product, setup_status, "ProductSupplier relationship missing or failed"))
@@ -442,6 +550,8 @@ def run_delta_onboarding(
     setup_failures = pd.DataFrame(setup_failure_rows, columns=SETUP_FAILURE_COLUMNS)
     append_ready = pd.DataFrame(append_rows, columns=TARGET_COLUMNS)
     missing_product_suppliers = pd.DataFrame(missing_product_supplier_rows, columns=MISSING_PRODUCT_SUPPLIER_COLUMNS)
+    supplier_info_only_targets_ready = _supplier_info_only_targets_ready(supplier_info_only)
+    supplier_info_only_mapping_quarantine = _supplier_info_only_mapping_quarantine(quarantine)
 
     summary = pd.DataFrame(
         [
@@ -456,19 +566,30 @@ def run_delta_onboarding(
             {"metric": "catalogue_delta_new_numeric_parent_families", "value": delta_stats["catalogue_delta_new_numeric_parent_families"]},
             {"metric": "pending_retry_rows_selected", "value": delta_stats["pending_retry_rows_selected"]},
             {"metric": "target_gap_rows_detected", "value": delta_stats["target_gap_rows_detected"]},
+            {"metric": "live_target_gap_rows_detected", "value": len(target_gaps)},
+            {"metric": "product_supplier_exists_but_target_missing_rows", "value": len(product_supplier_exists_but_target_missing)},
+            {"metric": "post_onboarding_target_rows_appended", "value": 0},
             {"metric": "target_gap_rows_appended", "value": 0},
             {"metric": "missing_product_supplier_rows_detected", "value": len(missing_product_suppliers)},
             {"metric": "missing_product_supplier_rows_created", "value": len(setup_success)},
             {"metric": "changed_parent_families_detected", "value": delta_stats.get("changed_parent_families_detected", 0)},
+            {"metric": "supplier_info_only_mapping_candidates", "value": delta_stats.get("supplier_info_only_mapping_candidates", len(supplier_info_only_map))},
+            {"metric": "supplier_info_only_mapping_ready", "value": len(supplier_info_only)},
+            {"metric": "supplier_info_only_mapping_quarantine", "value": int(quarantine["supplier_match_status"].astype(str).str.startswith("no_supplier_info_only").sum()) if not quarantine.empty else 0},
+            {"metric": "supplier_info_only_targets_appended", "value": 0},
+            {"metric": "supplier_info_only_product_suppliers_created", "value": int(setup_success["SKU"].astype(str).isin(supplier_info_only["SKU"].astype(str)).sum()) if not setup_success.empty and not supplier_info_only.empty else 0},
             {"metric": "scanned_products", "value": len(products)},
             {"metric": "scanned_variants", "value": scanned_variants},
             {"metric": "existing_target_rows", "value": len(targets)},
             {"metric": "skipped_existing_target_rows", "value": skipped_existing},
             {"metric": "skipped_success_state_rows", "value": skipped_state},
+            {"metric": "supplier_info_only_success_state_bypassed", "value": supplier_info_only_success_state_bypassed},
+            {"metric": "supplier_info_only_skipped_existing_target_rows", "value": supplier_info_only_skipped_existing_target_rows},
             {"metric": "new_rows_processed_this_run", "value": processed_new},
             {"metric": "promoted_supplier_synced_rows", "value": len(promoted)},
             {"metric": "protected_warehouse_only_rows", "value": len(protected)},
             {"metric": "supplier_info_only_rows", "value": len(supplier_info_only)},
+            {"metric": "supplier_info_only_target_rows", "value": len(supplier_info_only_targets_ready)},
             {"metric": "supplier_info_only_supplier_updates", "value": len(supplier_info_only[supplier_info_only["target_action"].astype(str).str.startswith("append")]) if not supplier_info_only.empty else 0},
             {"metric": "supplier_info_only_inventory_skips", "value": len(supplier_info_only)},
             {"metric": "parent_aggregate_rows", "value": len(parents)},
@@ -485,12 +606,15 @@ def run_delta_onboarding(
         "promoted": promoted,
         "protected": protected,
         "supplier_info_only": supplier_info_only,
+        "supplier_info_only_targets_ready": supplier_info_only_targets_ready,
+        "supplier_info_only_mapping_quarantine": supplier_info_only_mapping_quarantine,
         "parents": parents,
         "quarantine": quarantine,
         "setup_success": setup_success,
         "setup_failures": setup_failures,
         "append_ready": append_ready,
         "target_gaps": target_gaps,
+        "product_supplier_exists_but_target_missing": product_supplier_exists_but_target_missing,
         "missing_product_suppliers": missing_product_suppliers,
         "pending_retry_processed": pending_retry_processed,
         "target_gap_rows_ready": target_gap_rows_ready,
@@ -637,6 +761,7 @@ def _target_gap_candidates(
     targets: pd.DataFrame,
     supplier_ids: pd.DataFrame,
     supplier_stock: pd.DataFrame,
+    supplier_info_only_map: pd.DataFrame,
     warehouse_rules: list[dict[str, str]],
     children_by_parent: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
@@ -678,6 +803,25 @@ def _target_gap_candidates(
             }
         )
     return pd.DataFrame(rows, columns=TARGET_GAP_COLUMNS)
+
+
+def _product_supplier_exists_but_target_missing(client: StoreFeederApiClient, target_gaps: pd.DataFrame) -> pd.DataFrame:
+    if target_gaps.empty:
+        return pd.DataFrame(columns=TARGET_GAP_COLUMNS + ["product_supplier_status"])
+    rows: list[dict[str, Any]] = []
+    for _, gap in target_gaps.iterrows():
+        candidate = {
+            "supplier": str(gap.get("supplier", "")).strip(),
+            "SupplierID": str(gap.get("SupplierID", "")).strip(),
+            "Supplier.Name": str(gap.get("Supplier.Name", "")).strip(),
+            "supplier_sku": str(gap.get("SupplierSKU", "")).strip(),
+        }
+        product_id = str(gap.get("ProductID", "")).strip()
+        if product_id and _product_has_supplier(client, product_id, candidate):
+            row = gap.to_dict()
+            row["product_supplier_status"] = "exists"
+            rows.append(row)
+    return pd.DataFrame(rows, columns=TARGET_GAP_COLUMNS + ["product_supplier_status"])
 
 
 def _missing_product_supplier_row(product: pd.Series, candidate: dict[str, Any], status: str, action: str, reason: str) -> dict[str, Any]:
@@ -757,6 +901,7 @@ def _filter_products_for_catalogue_delta(
     children_by_parent: dict[str, pd.DataFrame],
     pending: dict[str, Any] | None,
     target_gaps: pd.DataFrame,
+    supplier_info_only_map: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     products = products.copy()
     products["_work_source"] = "catalogue_delta"
@@ -804,6 +949,21 @@ def _filter_products_for_catalogue_delta(
             selected_skus.add(sku.casefold())
             source_by_key["SKU:" + sku.casefold()] = "target_gap_recovery"
 
+    supplier_info_only_count = 0
+    if supplier_info_only_map is not None and not supplier_info_only_map.empty:
+        for _, mapped in supplier_info_only_map.iterrows():
+            child_sku = str(mapped.get("child_sku", "")).strip()
+            parent_sku = str(mapped.get("parent_sku", "")).strip()
+            mode = str(mapped.get("stock_update_mode", "")).strip().casefold()
+            if mode != "supplier_info_only_manual_inventory":
+                continue
+            if child_sku:
+                selected_skus.add(child_sku.casefold())
+                source_by_key["SKU:" + child_sku.casefold()] = "supplier_info_only_mapping"
+                supplier_info_only_count += 1
+            if parent_sku:
+                selected_parent_skus.add(parent_sku.casefold())
+
     pending_count = 0
     for item in pending.values():
         if not isinstance(item, dict):
@@ -841,6 +1001,7 @@ def _filter_products_for_catalogue_delta(
         "catalogue_delta_new_numeric_parent_families": len(numeric_parent_families),
         "pending_retry_rows_selected": pending_count,
         "target_gap_rows_detected": len(target_gaps),
+        "supplier_info_only_mapping_candidates": supplier_info_only_count,
         "changed_parent_families_detected": _count_changed_numeric_parent_families(catalogue_delta),
     }
     return selected, stats
@@ -1019,6 +1180,92 @@ def _read_targets(path: Path) -> pd.DataFrame:
     return targets
 
 
+
+def _load_supplier_info_only_map(path: Path) -> pd.DataFrame:
+    columns = ["parent_sku", "child_sku", "supplier_name", "supplier_id", "supplier_sku", "stock_update_mode", "notes"]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    df = read_csv(path)
+    for column in columns:
+        if column not in df.columns:
+            df[column] = ""
+        df[column] = df[column].fillna("").astype(str).str.strip()
+    return df[columns].copy()
+
+
+def _supplier_info_only_matches(product: pd.Series, protection_rule: dict[str, str], mapping: pd.DataFrame, supplier_stock: pd.DataFrame) -> list[dict[str, Any]]:
+    if mapping.empty:
+        return []
+    sku = str(product.get("SKU", "")).strip()
+    parent_sku = str(product.get("Parent SKU", "")).strip() or str(protection_rule.get("value", "")).strip()
+    rows = mapping[
+        mapping["child_sku"].astype(str).str.strip().str.casefold().eq(sku.casefold())
+        & mapping["stock_update_mode"].astype(str).str.strip().str.casefold().eq("supplier_info_only_manual_inventory")
+    ].copy()
+    if parent_sku:
+        rows = rows[rows["parent_sku"].astype(str).str.strip().str.casefold().eq(parent_sku.casefold())]
+    if len(rows) != 1:
+        return []
+    row = rows.iloc[0]
+    supplier = str(row.get("supplier_name", "")).strip()
+    supplier_sku = str(row.get("supplier_sku", "")).strip()
+    supplier_id = str(row.get("supplier_id", "")).strip()
+    if not supplier or not supplier_sku or not supplier_id:
+        return []
+    stock = supplier_stock.copy()
+    stock_matches = stock[
+        stock["supplier"].fillna("").astype(str).str.strip().str.casefold().eq(supplier.casefold())
+        & stock["supplier_sku"].fillna("").astype(str).str.strip().str.casefold().eq(supplier_sku.casefold())
+    ]
+    if len(stock_matches) != 1:
+        return []
+    stock_row = stock_matches.iloc[0]
+    return [
+        {
+            "supplier": supplier,
+            "SupplierID": supplier_id,
+            "Supplier.Name": supplier,
+            "supplier_sku": supplier_sku,
+            "supplier_free_stock": stock_row.get("supplier_free_stock", ""),
+        }
+    ]
+
+
+def _supplier_info_only_map_has_sku(product: pd.Series, mapping: pd.DataFrame) -> bool:
+    if mapping.empty:
+        return False
+    sku = str(product.get("SKU", "")).strip()
+    parent_sku = str(product.get("Parent SKU", "")).strip()
+    if not sku:
+        return False
+    rows = mapping[
+        mapping["child_sku"].astype(str).str.strip().str.casefold().eq(sku.casefold())
+        & mapping["stock_update_mode"].astype(str).str.strip().str.casefold().eq("supplier_info_only_manual_inventory")
+    ].copy()
+    if parent_sku:
+        rows = rows[rows["parent_sku"].astype(str).str.strip().str.casefold().eq(parent_sku.casefold())]
+    return not rows.empty
+
+
+def _supplier_info_only_targets_ready(supplier_info_only: pd.DataFrame) -> pd.DataFrame:
+    if supplier_info_only.empty:
+        return pd.DataFrame(columns=SUPPLIER_INFO_ONLY_COLUMNS)
+    return supplier_info_only[
+        supplier_info_only["target_action"].fillna("").astype(str).str.contains("append_supplier_info", case=False, na=False)
+    ].copy()
+
+
+def _supplier_info_only_mapping_quarantine(quarantine: pd.DataFrame) -> pd.DataFrame:
+    if quarantine.empty:
+        return pd.DataFrame(columns=QUARANTINE_COLUMNS)
+    status = quarantine["supplier_match_status"].fillna("").astype(str)
+    reason = quarantine["reason"].fillna("").astype(str)
+    return quarantine[
+        status.str.contains("supplier_info_only", case=False, na=False)
+        | reason.str.contains("supplier-info-only", case=False, na=False)
+    ].copy()
+
+
 def _load_supplier_ids(path: Path) -> pd.DataFrame:
     supplier_ids = read_csv(path)
     _require_columns(supplier_ids, ["supplier", "SupplierID", "Supplier.Name"], "supplier ID map")
@@ -1131,7 +1378,17 @@ def _supplier_info_only_target_row(product: pd.Series, candidate: dict[str, Any]
     }
 
 
-def _supplier_info_only_row(product: pd.Series, protection_rule: dict[str, str] | None, candidate: dict[str, Any], setup_status: str, target_action: str, reason: str) -> dict[str, Any]:
+def _supplier_info_only_row(
+    product: pd.Series,
+    protection_rule: dict[str, str] | None,
+    candidate: dict[str, Any],
+    setup_status: str,
+    target_action: str,
+    reason: str,
+    *,
+    success_state_bypassed: str = "no",
+    bypass_reason: str = "",
+) -> dict[str, Any]:
     protection_rule = protection_rule or {}
     return {
         "ProductID": str(product.get("ID", "")).strip(),
@@ -1147,6 +1404,9 @@ def _supplier_info_only_row(product: pd.Series, protection_rule: dict[str, str] 
         "product_supplier_status": setup_status,
         "target_action": target_action,
         "reason": reason,
+        "selected_source": str(product.get("_work_source", "")).strip() or "catalogue_delta",
+        "success_state_bypassed": success_state_bypassed,
+        "bypass_reason": bypass_reason,
     }
 
 def _promoted_row(product: pd.Series, candidate: dict[str, Any], setup_status: str, target_action: str, reason: str) -> dict[str, Any]:
@@ -1186,6 +1446,33 @@ def _state_key(product_id: str, sku: str) -> str:
     return "SKU:" + sku.casefold()
 
 
+def _lane_state_key(product_id: str, sku: str, candidate: dict[str, Any], stock_strategy: str) -> str:
+    base = _state_key(product_id, sku)
+    supplier_sku = str(candidate.get("supplier_sku", "")).strip().casefold()
+    supplier_id = str(candidate.get("SupplierID", "")).strip()
+    strategy = str(stock_strategy).strip().casefold()
+    return f"{base}|SupplierSKU:{supplier_sku}|SupplierID:{supplier_id}|Strategy:{strategy}"
+
+
+def _target_row_exists(targets: pd.DataFrame, *, product_id: str, sku: str, candidate: dict[str, Any], stock_strategy: str) -> bool:
+    if targets.empty:
+        return False
+    working = targets.copy()
+    for column in ["ProductID", "SKU", "SupplierSKU", "SupplierID", "stock_strategy"]:
+        if column not in working.columns:
+            working[column] = ""
+        working[column] = working[column].fillna("").astype(str).str.strip()
+    mask = (
+        working["SKU"].str.casefold().eq(str(sku).strip().casefold())
+        & working["SupplierSKU"].str.casefold().eq(str(candidate.get("supplier_sku", "")).strip().casefold())
+        & working["SupplierID"].eq(str(candidate.get("SupplierID", "")).strip())
+        & working["stock_strategy"].str.casefold().eq(str(stock_strategy).strip().casefold())
+    )
+    if product_id:
+        mask = mask & working["ProductID"].eq(str(product_id).strip())
+    return bool(mask.any())
+
+
 def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(state, dict):
         state = {}
@@ -1212,6 +1499,9 @@ def _save_processed(
     run_id: str,
     *,
     family_signature: str = "",
+    supplier_sku: str = "",
+    supplier_id: str = "",
+    stock_strategy: str = "",
 ) -> None:
     row = {
         "product_id": product_id,
@@ -1223,6 +1513,12 @@ def _save_processed(
     }
     if family_signature:
         row["family_signature"] = family_signature
+    if supplier_sku:
+        row["supplier_sku"] = supplier_sku
+    if supplier_id:
+        row["supplier_id"] = supplier_id
+    if stock_strategy:
+        row["stock_strategy"] = stock_strategy
     processed[key] = row
 
 
