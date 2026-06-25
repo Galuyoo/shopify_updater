@@ -189,7 +189,7 @@ def main() -> int:
             "refresh supplier stock files",
         )
 
-    targets = read_csv(args.targets)
+    targets = _active_targets(read_csv(args.targets))
     client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
     live_products = _load_live_products(client, page_size=100, limit=None)
     product_id_reconciliation, product_id_quarantine, targets = _reconcile_runtime_product_ids(targets, live_products)
@@ -321,30 +321,38 @@ def main() -> int:
     verification_failures_path = out_dir / "fast_stock_live_verification_failures.csv"
     verification_sample.to_csv(verification_sample_path, index=False)
     verification_failures.to_csv(verification_failures_path, index=False)
-    supplier_update_failures = _csv_count(live_paths["fast_stock_update_failures"])
-    supplier_retry_success = _csv_count(live_paths["fast_stock_supplier_update_retry_success"])
-    supplier_retry_failures = _csv_count(live_paths["fast_stock_supplier_update_retry_failures"])
-    supplier_missing_recovered = _csv_count(live_paths["fast_stock_supplier_missing_product_supplier_recovered"])
+    live_counts = _live_report_counts(
+        live_paths=live_paths,
+        location_live_paths=location_live_paths,
+        zero_location_live_paths=zero_location_live_paths,
+        preview=preview,
+        stock_location_preview=stock_location_preview,
+        zero_location_preview=zero_location_preview,
+    )
+    supplier_update_failures = live_counts["supplier_update_failures"]
+    supplier_retry_success = live_counts["supplier_update_retry_success"]
+    supplier_retry_failures = live_counts["supplier_update_retry_failures"]
+    supplier_missing_recovered = live_counts["supplier_update_missing_product_supplier_recovered"]
     supplier_info_only_success = _supplier_info_only_update_count(live_paths["fast_stock_update_success"], supplier_info_only_preview)
     supplier_info_only_failures = _supplier_info_only_update_count(live_paths["fast_stock_update_failures"], supplier_info_only_preview)
-    stock_location_update_failures = _csv_count(location_live_paths["fast_stock_location_update_failures"])
-    zero_location_update_failures = _csv_count(zero_location_live_paths["fast_stock_location_zero_update_failures"])
+    stock_location_update_failures = live_counts["stock_location_update_failures"]
+    zero_location_update_failures = live_counts["zero_other_locations_failures"]
     summary = _summary_frame(
         targets,
         preview,
         stock_location_preview,
         invalid_rows,
         args.live_stock_update,
-        supplier_update_success=_csv_count(live_paths["fast_stock_update_success"]),
+        supplier_update_success=live_counts["supplier_update_success"],
         supplier_update_failures=supplier_update_failures,
-        stock_location_update_success=_csv_count(location_live_paths["fast_stock_location_update_success"]),
+        stock_location_update_success=live_counts["stock_location_update_success"],
         stock_location_update_failures=stock_location_update_failures,
         retry_count=stock_location_retry_count + zero_location_retry_count,
         channel_safety_skips=channel_safety_skips,
         zero_location_preview=zero_location_preview,
         zero_location_safety_skips=zero_location_safety_skips,
         supplier_info_only_preview=supplier_info_only_preview,
-        zero_other_locations_success=_csv_count(zero_location_live_paths["fast_stock_location_zero_update_success"]),
+        zero_other_locations_success=live_counts["zero_other_locations_success"],
         zero_other_locations_failures=zero_location_update_failures,
         supplier_update_initial_failures=supplier_retry_success + supplier_retry_failures,
         supplier_update_retry_success=supplier_retry_success,
@@ -358,8 +366,11 @@ def main() -> int:
         scheduled_run=args.scheduled_run,
         product_id_reconciliation=product_id_reconciliation,
         product_id_quarantine=product_id_quarantine,
+        live_update_skip_reason=live_counts["live_update_skip_reason"],
     )
     summary.to_csv(paths["fast_stock_summary"], index=False)
+    print("\nFinal live summary from API report CSVs:")
+    print(summary.to_string(index=False))
     print("\nLive stock update reports:")
     for path in [*live_paths.values(), *location_live_paths.values(), *zero_location_live_paths.values()]:
         print(path)
@@ -471,6 +482,13 @@ def _backup_and_write_targets(target_path: Path, targets: pd.DataFrame, run_id: 
     backup_path = target_path.with_name(f"{target_path.stem}.backup_{run_id}{target_path.suffix}")
     shutil.copy2(target_path, backup_path)
     targets.to_csv(target_path, index=False)
+
+
+def _active_targets(targets: pd.DataFrame) -> pd.DataFrame:
+    if targets.empty or "disabled" not in targets.columns:
+        return targets.copy()
+    disabled = targets["disabled"].fillna("").astype(str).str.strip().str.casefold()
+    return targets[~disabled.isin({"yes", "true", "1", "y"})].copy()
 
 
 def build_fast_payload_preview(
@@ -1197,6 +1215,42 @@ def _supplier_info_only_payload_preview(preview: pd.DataFrame, targets: pd.DataF
     subset = preview[preview.apply(lambda row: (str(row["ProductID"]), str(row["SupplierSKU"]).upper()) in keys, axis=1)].copy()
     return subset.reindex(columns=PAYLOAD_COLUMNS, fill_value="")
 
+
+def _live_report_counts(
+    *,
+    live_paths: dict[str, Path],
+    location_live_paths: dict[str, Path],
+    zero_location_live_paths: dict[str, Path],
+    preview: pd.DataFrame,
+    stock_location_preview: pd.DataFrame,
+    zero_location_preview: pd.DataFrame,
+) -> dict[str, int | str]:
+    counts: dict[str, int | str] = {
+        "supplier_update_success": _csv_count(live_paths["fast_stock_update_success"]),
+        "supplier_update_failures": _csv_count(live_paths["fast_stock_update_failures"]),
+        "supplier_update_retry_success": _csv_count(live_paths["fast_stock_supplier_update_retry_success"]),
+        "supplier_update_retry_failures": _csv_count(live_paths["fast_stock_supplier_update_retry_failures"]),
+        "supplier_update_missing_product_supplier_recovered": _csv_count(live_paths["fast_stock_supplier_missing_product_supplier_recovered"]),
+        "stock_location_update_success": _csv_count(location_live_paths["fast_stock_location_update_success"]),
+        "stock_location_update_failures": _csv_count(location_live_paths["fast_stock_location_update_failures"]),
+        "zero_other_locations_success": _csv_count(zero_location_live_paths["fast_stock_location_zero_update_success"]),
+        "zero_other_locations_failures": _csv_count(zero_location_live_paths["fast_stock_location_zero_update_failures"]),
+        "live_update_skip_reason": "",
+    }
+    supplier_total = int(counts["supplier_update_success"]) + int(counts["supplier_update_failures"])
+    location_total = int(counts["stock_location_update_success"]) + int(counts["stock_location_update_failures"])
+    zero_total = int(counts["zero_other_locations_success"]) + int(counts["zero_other_locations_failures"])
+    reasons = []
+    if len(preview) > 0 and supplier_total == 0:
+        reasons.append("supplier_update_reports_empty_or_not_written")
+    if len(stock_location_preview) > 0 and location_total == 0:
+        reasons.append("stock_location_update_reports_empty_or_not_written")
+    if len(zero_location_preview) > 0 and zero_total == 0:
+        reasons.append("zero_other_locations_update_reports_empty_or_not_written")
+    counts["live_update_skip_reason"] = "|".join(reasons)
+    return counts
+
+
 def _summary_frame(
     targets: pd.DataFrame,
     preview: pd.DataFrame,
@@ -1227,6 +1281,7 @@ def _summary_frame(
     scheduled_run: bool = False,
     product_id_reconciliation: pd.DataFrame | None = None,
     product_id_quarantine: pd.DataFrame | None = None,
+    live_update_skip_reason: str = "",
 ) -> pd.DataFrame:
     channel_safety_skips = channel_safety_skips if channel_safety_skips is not None else pd.DataFrame(columns=CHANNEL_SAFETY_SKIP_COLUMNS)
     zero_location_preview = zero_location_preview if zero_location_preview is not None else pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
@@ -1275,6 +1330,7 @@ def _summary_frame(
             {"metric": "zero_other_locations_failures", "value": zero_other_locations_failures},
             {"metric": "retry_count", "value": retry_count},
             {"metric": "live_stock_update", "value": "yes" if live else "no"},
+            {"metric": "live_update_skip_reason", "value": live_update_skip_reason},
         ]
     )
 

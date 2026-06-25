@@ -195,6 +195,7 @@ def main() -> int:
         _write_state(args.state_file, new_state)
 
     summary = _replace_summary_metric(summary, "target_rows_appended", appended_count)
+    summary = _replace_summary_metric(summary, "instock_supplier_info_only_appended", len(_instock_supplier_info_only_appended(target_rows_appended)))
     if args.execute:
         summary = _replace_summary_metric(summary, "target_gap_rows_appended", result.get("target_gap_rows_ready", 0) if appended_count else 0)
         summary = _replace_summary_metric(summary, "post_onboarding_target_rows_appended", appended_count)
@@ -220,6 +221,9 @@ def main() -> int:
         "supplier_info_only_targets_ready": out_dir / "supplier_info_only_targets_ready.csv",
         "supplier_info_only_targets_appended": out_dir / "supplier_info_only_targets_appended.csv",
         "supplier_info_only_mapping_quarantine": out_dir / "supplier_info_only_mapping_quarantine.csv",
+        "instock_supplier_info_only_ready": out_dir / "instock_supplier_info_only_ready.csv",
+        "instock_supplier_info_only_appended": out_dir / "instock_supplier_info_only_appended.csv",
+        "instock_supplier_info_only_quarantine": out_dir / "instock_supplier_info_only_quarantine.csv",
         "parent_aggregates": out_dir / "parent_aggregates.csv",
         "quarantine": out_dir / "quarantine.csv",
         "product_supplier_setup_success": out_dir / "product_supplier_setup_success.csv",
@@ -244,6 +248,8 @@ def main() -> int:
     result["supplier_info_only"].to_csv(paths["protected_manual_inventory_supplier_info_only"], index=False)
     result["supplier_info_only_targets_ready"].to_csv(paths["supplier_info_only_targets_ready"], index=False)
     result["supplier_info_only_mapping_quarantine"].to_csv(paths["supplier_info_only_mapping_quarantine"], index=False)
+    result["instock_supplier_info_only_ready"].to_csv(paths["instock_supplier_info_only_ready"], index=False)
+    result["instock_supplier_info_only_quarantine"].to_csv(paths["instock_supplier_info_only_quarantine"], index=False)
     parents.to_csv(paths["parent_aggregates"], index=False)
     quarantine.to_csv(paths["quarantine"], index=False)
     setup_success.to_csv(paths["product_supplier_setup_success"], index=False)
@@ -253,6 +259,7 @@ def main() -> int:
     target_rows_appended[
         target_rows_appended.get("stock_strategy", pd.Series(dtype=str)).astype(str).str.casefold().eq("supplier_info_only_manual_inventory")
     ].to_csv(paths["supplier_info_only_targets_appended"], index=False)
+    _instock_supplier_info_only_appended(target_rows_appended).to_csv(paths["instock_supplier_info_only_appended"], index=False)
 
     print("StoreFeeder new product onboarding delta")
     print(summary.to_string(index=False))
@@ -350,9 +357,16 @@ def run_delta_onboarding(
         state_key = _state_key(product_id, sku)
         product_state = processed.get(state_key, {})
 
+        if _is_instock_sku(sku) and _is_numeric_parent_sku(_instock_base_sku(sku)):
+            quarantine_rows.append(_quarantine_row(product, "instock_parent_or_aggregate", "INSTOCK parent/aggregate rows are not stock update targets"))
+            continue
+
         protection_rule = _match_protection_rule(sku, parent_sku, warehouse_rules)
         has_supplier_info_only_mapping = _supplier_info_only_map_has_sku(product, supplier_info_only_map)
+        instock_supplier_info_only_mode = _is_instock_sku(sku)
         supplier_info_only_mode = bool(
+            instock_supplier_info_only_mode
+            or
             (protection_rule and protection_rule.get("stock_update_mode") == "supplier_info_only_manual_inventory")
             or has_supplier_info_only_mapping
         )
@@ -417,13 +431,21 @@ def run_delta_onboarding(
             quarantine_rows.append(_quarantine_row(product, "duplicate_live_storefeeder_sku", "Supplier-info-only mapping requires exactly one live StoreFeeder child SKU"))
             continue
 
-        exact_matches = _supplier_info_only_matches(product, protection_rule, supplier_info_only_map, supplier_stock) if supplier_info_only_mode else _exact_supplier_matches(sku, supplier_ids, supplier_stock)
+        if instock_supplier_info_only_mode:
+            exact_matches = _instock_supplier_info_only_matches(product, supplier_ids, supplier_stock)
+        elif supplier_info_only_mode:
+            exact_matches = _supplier_info_only_matches(product, protection_rule, supplier_info_only_map, supplier_stock)
+        else:
+            exact_matches = _exact_supplier_matches(sku, supplier_ids, supplier_stock)
         if len(exact_matches) == 0:
-            reason = "No approved supplier-info-only mapping or supplier feed validation failed" if supplier_info_only_mode else "StoreFeeder SKU was not found exactly once in supplier feeds"
-            quarantine_rows.append(_quarantine_row(product, "no_supplier_info_only_mapping" if supplier_info_only_mode else "no_exact_supplier_sku_match", reason))
+            if instock_supplier_info_only_mode:
+                quarantine_rows.append(_quarantine_row(product, "instock_supplier_feed_match_missing", "INSTOCK base supplier SKU was not found exactly once in supplier feeds"))
+            else:
+                reason = "No approved supplier-info-only mapping or supplier feed validation failed" if supplier_info_only_mode else "StoreFeeder SKU was not found exactly once in supplier feeds"
+                quarantine_rows.append(_quarantine_row(product, "no_supplier_info_only_mapping" if supplier_info_only_mode else "no_exact_supplier_sku_match", reason))
             continue
         if len(exact_matches) > 1:
-            quarantine_rows.append(_quarantine_row(product, "ambiguous_exact_supplier_sku_match", "StoreFeeder SKU matched multiple supplier feeds or duplicate supplier rows"))
+            quarantine_rows.append(_quarantine_row(product, "instock_supplier_feed_match_duplicate" if instock_supplier_info_only_mode else "ambiguous_exact_supplier_sku_match", "StoreFeeder SKU matched multiple supplier feeds or duplicate supplier rows"))
             continue
 
         candidate = exact_matches[0]
@@ -508,7 +530,7 @@ def run_delta_onboarding(
                         candidate,
                         setup_status,
                         "append_supplier_info_only_target",
-                        "supplier-info-only manual inventory lane; append supplier payload target but skip all inventory/location updates",
+                        "INSTOCK supplier-info-only lane; append supplier payload target but skip all inventory/location updates" if instock_supplier_info_only_mode else "supplier-info-only manual inventory lane; append supplier payload target but skip all inventory/location updates",
                         success_state_bypassed=success_state_bypassed,
                         bypass_reason=bypass_reason,
                     )
@@ -552,6 +574,8 @@ def run_delta_onboarding(
     missing_product_suppliers = pd.DataFrame(missing_product_supplier_rows, columns=MISSING_PRODUCT_SUPPLIER_COLUMNS)
     supplier_info_only_targets_ready = _supplier_info_only_targets_ready(supplier_info_only)
     supplier_info_only_mapping_quarantine = _supplier_info_only_mapping_quarantine(quarantine)
+    instock_supplier_info_only_ready = _instock_supplier_info_only_ready(supplier_info_only)
+    instock_supplier_info_only_quarantine = _instock_supplier_info_only_quarantine(quarantine)
 
     summary = pd.DataFrame(
         [
@@ -592,6 +616,10 @@ def run_delta_onboarding(
             {"metric": "supplier_info_only_target_rows", "value": len(supplier_info_only_targets_ready)},
             {"metric": "supplier_info_only_supplier_updates", "value": len(supplier_info_only[supplier_info_only["target_action"].astype(str).str.startswith("append")]) if not supplier_info_only.empty else 0},
             {"metric": "supplier_info_only_inventory_skips", "value": len(supplier_info_only)},
+            {"metric": "instock_supplier_info_only_ready", "value": len(instock_supplier_info_only_ready)},
+            {"metric": "instock_supplier_info_only_appended", "value": 0},
+            {"metric": "instock_supplier_info_only_quarantine", "value": len(instock_supplier_info_only_quarantine)},
+            {"metric": "instock_product_suppliers_created", "value": int(setup_success["SKU"].astype(str).map(_is_instock_sku).sum()) if not setup_success.empty else 0},
             {"metric": "parent_aggregate_rows", "value": len(parents)},
             {"metric": "quarantine_rows", "value": len(quarantine)},
             {"metric": "product_supplier_setup_success_rows", "value": len(setup_success)},
@@ -608,6 +636,8 @@ def run_delta_onboarding(
         "supplier_info_only": supplier_info_only,
         "supplier_info_only_targets_ready": supplier_info_only_targets_ready,
         "supplier_info_only_mapping_quarantine": supplier_info_only_mapping_quarantine,
+        "instock_supplier_info_only_ready": instock_supplier_info_only_ready,
+        "instock_supplier_info_only_quarantine": instock_supplier_info_only_quarantine,
         "parents": parents,
         "quarantine": quarantine,
         "setup_success": setup_success,
@@ -1231,6 +1261,28 @@ def _supplier_info_only_matches(product: pd.Series, protection_rule: dict[str, s
     ]
 
 
+def _is_instock_sku(sku: str) -> bool:
+    return str(sku).strip().upper().endswith("_INSTOCK")
+
+
+def _instock_base_sku(sku: str) -> str:
+    value = str(sku).strip()
+    return value[:-8] if value.upper().endswith("_INSTOCK") else value
+
+
+def _instock_supplier_info_only_matches(product: pd.Series, supplier_ids: pd.DataFrame, supplier_stock: pd.DataFrame) -> list[dict[str, Any]]:
+    sku = str(product.get("SKU", "")).strip()
+    if not _is_instock_sku(sku):
+        return []
+    base_sku = _instock_base_sku(sku)
+    if not base_sku or _is_numeric_parent_sku(base_sku):
+        return []
+    matches = _exact_supplier_matches(base_sku, supplier_ids, supplier_stock)
+    for match in matches:
+        match["supplier_sku"] = base_sku
+    return matches
+
+
 def _supplier_info_only_map_has_sku(product: pd.Series, mapping: pd.DataFrame) -> bool:
     if mapping.empty:
         return False
@@ -1245,6 +1297,31 @@ def _supplier_info_only_map_has_sku(product: pd.Series, mapping: pd.DataFrame) -
     if parent_sku:
         rows = rows[rows["parent_sku"].astype(str).str.strip().str.casefold().eq(parent_sku.casefold())]
     return not rows.empty
+
+
+def _instock_supplier_info_only_ready(supplier_info_only: pd.DataFrame) -> pd.DataFrame:
+    if supplier_info_only.empty:
+        return pd.DataFrame(columns=SUPPLIER_INFO_ONLY_COLUMNS)
+    return supplier_info_only[supplier_info_only["SKU"].fillna("").astype(str).map(_is_instock_sku)].copy()
+
+
+def _instock_supplier_info_only_appended(target_rows: pd.DataFrame) -> pd.DataFrame:
+    if target_rows.empty:
+        return pd.DataFrame(columns=TARGET_COLUMNS)
+    return target_rows[
+        target_rows["SKU"].fillna("").astype(str).map(_is_instock_sku)
+        & target_rows.get("stock_strategy", pd.Series("", index=target_rows.index)).fillna("").astype(str).str.casefold().eq("supplier_info_only_manual_inventory")
+    ].copy()
+
+
+def _instock_supplier_info_only_quarantine(quarantine: pd.DataFrame) -> pd.DataFrame:
+    if quarantine.empty:
+        return pd.DataFrame(columns=QUARANTINE_COLUMNS)
+    status = quarantine["supplier_match_status"].fillna("").astype(str)
+    return quarantine[
+        quarantine["SKU"].fillna("").astype(str).map(_is_instock_sku)
+        | status.str.contains("instock", case=False, na=False)
+    ].copy()
 
 
 def _supplier_info_only_targets_ready(supplier_info_only: pd.DataFrame) -> pd.DataFrame:

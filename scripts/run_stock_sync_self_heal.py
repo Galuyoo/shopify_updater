@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -59,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fix-product-ids", action="store_true")
     parser.add_argument("--create-missing-product-suppliers", action="store_true")
+    parser.add_argument("--repair-invalid-targets", action="store_true")
     parser.add_argument("--parent-sku")
     parser.add_argument("--target-file", type=Path, default=Path("data/storefeeder_supplier_stock_update_targets.csv"))
     parser.add_argument("--supplier-id-map", type=Path, default=Path("data/storefeeder_supplier_ids.csv"))
@@ -100,6 +102,22 @@ def main() -> int:
 
     live_duplicates = _live_sku_duplicates(products)
     live_index = _unique_live_index(products, live_duplicates)
+    cleanup_detected, cleanup_repaired, cleanup_disabled, cleaned_targets, cleanup_summary = _repair_invalid_targets(
+        targets=targets,
+        live_index=live_index,
+        live_duplicates=live_duplicates,
+        supplier_ids=supplier_ids,
+        supplier_info_only_map=supplier_info_only_map,
+    )
+    cleanup_applied = False
+    if args.execute and args.repair_invalid_targets and not args.parent_sku and (
+        not cleanup_repaired.empty or not cleanup_disabled.empty
+    ):
+        _backup_and_write_targets(args.target_file, cleaned_targets, run_id)
+        targets = cleaned_targets.copy()
+        cleanup_applied = True
+    elif args.repair_invalid_targets:
+        targets = cleaned_targets.copy()
     target_reconciliation, stale_quarantine, reconciled_targets = _reconcile_target_product_ids(targets, live_index, live_duplicates)
     feed_missing, feed_duplicate = _target_supplier_feed_quarantine(reconciled_targets, supplier_stock)
     missing_supplier, created_supplier, create_failures = _heal_missing_product_suppliers(
@@ -115,11 +133,19 @@ def main() -> int:
         supplier_costs=args.supplier_costs,
     )
     new_variants = _new_variants_detected(products, reconciled_targets)
-    normal_missing_targets, normal_quarantine = _normal_target_gaps(products, reconciled_targets, supplier_ids, supplier_stock, protection_rules)
+    normal_missing_targets, normal_quarantine, supplier_info_only_family_base_suppressed = _normal_target_gaps(
+        products,
+        reconciled_targets,
+        supplier_ids,
+        supplier_stock,
+        protection_rules,
+        supplier_info_only_map,
+    )
     info_ready, info_quarantine, manual_profile_needed = _supplier_info_only_gaps(
         products,
         reconciled_targets,
         supplier_info_only_map,
+        supplier_ids,
         supplier_stock,
         protection_rules,
     )
@@ -152,6 +178,19 @@ def main() -> int:
             appended_count = _append_targets(args.target_file, append_ready[TARGET_COLUMNS].copy(), out_dir, run_id)
             appended_path = out_dir / "target_rows_appended_to_file.csv"
             appended = read_csv(appended_path) if appended_path.exists() else pd.DataFrame(columns=TARGET_COLUMNS)
+            if args.create_missing_product_suppliers and not appended.empty:
+                appended_missing, appended_created, appended_failures = _verify_or_create_product_suppliers_for_targets(
+                    client=client,
+                    targets_to_check=appended,
+                    live_index=live_index,
+                    supplier_stock=supplier_stock,
+                    supplier_info_only_map=supplier_info_only_map,
+                    execute=True,
+                    supplier_costs=args.supplier_costs,
+                )
+                missing_supplier = pd.concat([missing_supplier, appended_missing], ignore_index=True)
+                created_supplier = pd.concat([created_supplier, appended_created], ignore_index=True)
+                create_failures = pd.concat([create_failures, appended_failures], ignore_index=True)
 
     quarantine_rows = pd.concat(
         [
@@ -183,7 +222,14 @@ def main() -> int:
             quarantine=quarantine_rows,
             safe_to_run_fast_sync=safe_to_run_fast_sync,
             execute=args.execute,
+            invalid_cleanup=cleanup_summary,
+            invalid_cleanup_applied=cleanup_applied,
+            supplier_info_only_family_base_suppressed=supplier_info_only_family_base_suppressed,
         ),
+        "target_cleanup_summary": cleanup_summary,
+        "invalid_targets_detected": cleanup_detected,
+        "invalid_targets_repaired": cleanup_repaired,
+        "invalid_targets_disabled": cleanup_disabled,
         "live_sku_index_duplicates": live_duplicates,
         "stale_product_id_reconciliations": target_reconciliation,
         "target_product_id_updates_applied": target_updates_applied,
@@ -194,12 +240,16 @@ def main() -> int:
         "missing_product_supplier_created": created_supplier,
         "product_supplier_create_failures": create_failures,
         "target_rows_missing_detected": append_ready,
+        "supplier_info_only_family_base_targets_suppressed": supplier_info_only_family_base_suppressed,
         "target_rows_appended": appended,
         "new_variants_detected": new_variants,
         "supplier_feed_missing_quarantine": supplier_feed_missing_report,
         "supplier_feed_duplicate_quarantine": supplier_feed_duplicate_report,
         "supplier_info_only_mapping_ready": info_ready,
         "supplier_info_only_mapping_quarantine": info_quarantine,
+        "instock_supplier_info_only_ready": _instock_target_rows(info_ready),
+        "instock_supplier_info_only_appended": _instock_target_rows(appended),
+        "instock_supplier_info_only_quarantine": _instock_quarantine_rows(pd.concat([info_quarantine, quarantine_rows], ignore_index=True)),
         "manual_profile_mapping_needed": manual_profile_needed,
         "quarantine": quarantine_rows,
         "recommended_user_actions": _recommended_actions(quarantine_rows, manual_profile_needed, safe_to_run_fast_sync),
@@ -243,6 +293,214 @@ def _read_targets(path: Path) -> pd.DataFrame:
         if column not in targets.columns:
             targets[column] = ""
     return targets.copy()
+
+
+def _repair_invalid_targets(
+    *,
+    targets: pd.DataFrame,
+    live_index: dict[str, pd.Series],
+    live_duplicates: pd.DataFrame,
+    supplier_ids: pd.DataFrame,
+    supplier_info_only_map: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    detected: list[dict[str, Any]] = []
+    repaired: list[dict[str, Any]] = []
+    disabled: list[dict[str, Any]] = []
+    cleaned = targets.copy()
+    disabled_indexes: set[int] = set()
+    duplicate_skus = _duplicate_live_sku_keys(live_duplicates)
+    supplier_id_by_name = _supplier_id_lookup(supplier_ids)
+    explicit_info_only = _supplier_info_only_target_keys(supplier_info_only_map)
+    info_only_supplier_prefixes = _supplier_info_only_supplier_prefixes(supplier_info_only_map)
+
+    for index, row in targets.iterrows():
+        sku = str(row.get("SKU", "")).strip()
+        supplier = str(row.get("supplier", "")).strip()
+        supplier_name = str(row.get("Supplier.Name", "")).strip() or supplier
+        supplier_sku = str(row.get("SupplierSKU", "")).strip()
+        supplier_id = str(row.get("SupplierID", "")).strip()
+        strategy = str(row.get("stock_strategy", "")).strip()
+        strategy_key = strategy.casefold()
+        sku_key = sku.casefold()
+        is_explicit_info_only = (
+            _is_instock_sku(sku)
+            or strategy_key == "supplier_info_only_manual_inventory"
+            or (sku_key, supplier_sku.casefold()) in explicit_info_only
+        )
+        is_info_only_family_base_target = (
+            strategy_key == "supplier_synced_inventory"
+            and sku
+            and supplier_sku
+            and sku.casefold() == supplier_sku.casefold()
+            and _supplier_sku_prefix(supplier_sku).casefold() in info_only_supplier_prefixes
+        )
+        reasons = []
+        if not sku:
+            reasons.append("missing_sku")
+        elif sku_key in duplicate_skus:
+            reasons.append("duplicate_live_storefeeder_sku")
+        elif sku_key not in live_index:
+            reasons.append("missing_live_storefeeder_sku")
+        if not supplier_sku:
+            reasons.append("missing_supplier_sku")
+        if not supplier_id:
+            reasons.append("missing_supplier_id")
+        if strategy_key not in {"supplier_synced_inventory", "supplier_info_only_manual_inventory", "warehouse_only"}:
+            reasons.append("invalid_stock_strategy")
+        if is_explicit_info_only and (
+            strategy_key != "supplier_info_only_manual_inventory"
+            or str(row.get("skip_stock_location_update", "")).strip().casefold() != "yes"
+            or str(row.get("allow_stock_location_update", "")).strip().casefold() != "no"
+            or str(row.get("stock_location", "")).strip()
+            or str(row.get("sellable_stock_location", "")).strip()
+        ):
+            reasons.append("supplier_info_only_lane_fields_invalid")
+        if reasons:
+            detected.append(_target_cleanup_row(row, ";".join(reasons), "detected"))
+
+        if is_info_only_family_base_target:
+            disabled.append(_target_cleanup_row(row, "disabled_supplier_info_only_family_base_target", "disabled"))
+            disabled_indexes.add(index)
+            continue
+        if sku and (sku_key in duplicate_skus or sku_key not in live_index) and not is_explicit_info_only:
+            disabled.append(_target_cleanup_row(row, "disabled_missing_or_duplicate_live_storefeeder_sku", "disabled"))
+            disabled_indexes.add(index)
+            continue
+
+        changed = False
+        if not supplier_id and supplier_name.casefold() in supplier_id_by_name:
+            cleaned.loc[index, "SupplierID"] = supplier_id_by_name[supplier_name.casefold()]
+            changed = True
+        if is_explicit_info_only:
+            info_values = {
+                "stock_strategy": "supplier_info_only_manual_inventory",
+                "skip_stock_location_update": "yes",
+                "allow_stock_location_update": "no",
+                "stock_location": "",
+                "sellable_stock_location": "",
+            }
+            for column, value in info_values.items():
+                if column in cleaned.columns and str(cleaned.at[index, column]).strip() != value:
+                    cleaned.loc[index, column] = value
+                    changed = True
+        if changed:
+            repaired.append(_target_cleanup_row(cleaned.loc[index], "deterministic_target_repair", "repaired"))
+
+    if disabled_indexes:
+        cleaned = cleaned.drop(index=list(disabled_indexes)).reset_index(drop=True)
+    summary = pd.DataFrame(
+        [
+            {"metric": "invalid_targets_detected", "value": len(detected)},
+            {"metric": "invalid_targets_repaired", "value": len(repaired)},
+            {"metric": "invalid_targets_disabled", "value": len(disabled)},
+            {"metric": "post_cleanup_target_rows", "value": len(cleaned)},
+        ],
+        columns=SUMMARY_COLUMNS,
+    )
+    return (
+        pd.DataFrame(detected, columns=_target_cleanup_columns()),
+        pd.DataFrame(repaired, columns=_target_cleanup_columns()),
+        pd.DataFrame(disabled, columns=_target_cleanup_columns()),
+        cleaned,
+        summary,
+    )
+
+
+def _target_cleanup_columns() -> list[str]:
+    return [
+        "action",
+        "reason",
+        "ProductID",
+        "SKU",
+        "supplier",
+        "SupplierID",
+        "Supplier.Name",
+        "SupplierSKU",
+        "stock_strategy",
+        "skip_stock_location_update",
+        "allow_stock_location_update",
+        "stock_location",
+        "sellable_stock_location",
+    ]
+
+
+def _target_cleanup_row(row: pd.Series, reason: str, action: str) -> dict[str, str]:
+    return {
+        "action": action,
+        "reason": reason,
+        "ProductID": str(row.get("ProductID", "")).strip(),
+        "SKU": str(row.get("SKU", "")).strip(),
+        "supplier": str(row.get("supplier", "")).strip(),
+        "SupplierID": str(row.get("SupplierID", "")).strip(),
+        "Supplier.Name": str(row.get("Supplier.Name", "")).strip(),
+        "SupplierSKU": str(row.get("SupplierSKU", "")).strip(),
+        "stock_strategy": str(row.get("stock_strategy", "")).strip(),
+        "skip_stock_location_update": str(row.get("skip_stock_location_update", "")).strip(),
+        "allow_stock_location_update": str(row.get("allow_stock_location_update", "")).strip(),
+        "stock_location": str(row.get("stock_location", "")).strip(),
+        "sellable_stock_location": str(row.get("sellable_stock_location", "")).strip(),
+    }
+
+
+def _supplier_id_lookup(supplier_ids: pd.DataFrame) -> dict[str, str]:
+    lookup = {}
+    for _, row in supplier_ids.iterrows():
+        supplier_id = str(row.get("SupplierID", "")).strip()
+        for column in ["supplier", "Supplier.Name"]:
+            name = str(row.get(column, "")).strip()
+            if name and supplier_id:
+                lookup[name.casefold()] = supplier_id
+    return lookup
+
+
+def _supplier_info_only_target_keys(mapping: pd.DataFrame) -> set[tuple[str, str]]:
+    if mapping.empty or "child_sku" not in mapping.columns or "supplier_sku" not in mapping.columns:
+        return set()
+    mode = mapping.get("stock_update_mode", pd.Series("", index=mapping.index)).fillna("").astype(str).str.strip().str.casefold()
+    rows = mapping[mode.eq("supplier_info_only_manual_inventory")]
+    return {
+        (str(row.get("child_sku", "")).strip().casefold(), str(row.get("supplier_sku", "")).strip().casefold())
+        for _, row in rows.iterrows()
+        if str(row.get("child_sku", "")).strip() and str(row.get("supplier_sku", "")).strip()
+    }
+
+
+def _supplier_info_only_supplier_prefixes(mapping: pd.DataFrame) -> set[str]:
+    if mapping.empty or "supplier_sku" not in mapping.columns:
+        return set()
+    mode = mapping.get("stock_update_mode", pd.Series("", index=mapping.index)).fillna("").astype(str).str.strip().str.casefold()
+    rows = mapping[mode.eq("supplier_info_only_manual_inventory")]
+    return {
+        prefix.casefold()
+        for value in rows["supplier_sku"].fillna("").astype(str)
+        for prefix in [_supplier_sku_prefix(value)]
+        if prefix
+    }
+
+
+def _supplier_sku_prefix(supplier_sku: str) -> str:
+    value = str(supplier_sku).strip().upper()
+    match = re.match(r"^([A-Z]+\d+)", value)
+    return match.group(1) if match else ""
+
+
+def _is_supplier_info_only_family_base_sku(sku: str, candidate: dict[str, Any], info_only_supplier_prefixes: set[str]) -> bool:
+    supplier_sku = str(candidate.get("supplier_sku", "")).strip()
+    if not sku or not supplier_sku or str(sku).strip().casefold() != supplier_sku.casefold():
+        return False
+    prefix = _supplier_sku_prefix(supplier_sku).casefold()
+    return bool(prefix and prefix in info_only_supplier_prefixes)
+
+
+def _duplicate_live_sku_keys(live_duplicates: pd.DataFrame) -> set[str]:
+    keys: set[str] = set()
+    if live_duplicates.empty or "SKU" not in live_duplicates.columns:
+        return keys
+    for value in live_duplicates["SKU"].fillna("").astype(str):
+        for sku in value.split("|"):
+            if sku.strip():
+                keys.add(sku.strip().casefold())
+    return keys
 
 
 def _live_sku_duplicates(products: pd.DataFrame) -> pd.DataFrame:
@@ -340,11 +598,38 @@ def _heal_missing_product_suppliers(
         if scan_all_targets
         else _targets_with_recent_supplier_failures(targets, latest_supplier_failures)
     )
+    return _verify_or_create_product_suppliers_for_targets(
+        client=client,
+        targets_to_check=targets_to_check,
+        live_index=live_index,
+        supplier_stock=supplier_stock,
+        supplier_info_only_map=supplier_info_only_map,
+        execute=execute,
+        supplier_costs=supplier_costs,
+    )
+
+
+def _verify_or_create_product_suppliers_for_targets(
+    *,
+    client: StoreFeederApiClient,
+    targets_to_check: pd.DataFrame,
+    live_index: dict[str, pd.Series],
+    supplier_stock: pd.DataFrame,
+    supplier_info_only_map: pd.DataFrame,
+    execute: bool,
+    supplier_costs: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    missing_rows = []
+    created_rows: list[dict[str, Any]] = []
+    failure_rows: list[dict[str, Any]] = []
     for _, target in targets_to_check.iterrows():
         strategy = str(target.get("stock_strategy", "")).strip()
         if not _can_create_product_supplier_for_strategy(strategy):
             continue
-        if strategy.casefold() == "supplier_info_only_manual_inventory" and not _supplier_info_only_mapping_allows_target(target, supplier_info_only_map):
+        if strategy.casefold() == "supplier_info_only_manual_inventory" and not (
+            _supplier_info_only_mapping_allows_target(target, supplier_info_only_map)
+            or _instock_target_allows_supplier_info_only(target)
+        ):
             continue
         product = live_index.get(str(target.get("SKU", "")).strip().casefold())
         if product is None:
@@ -457,35 +742,82 @@ def _new_variants_detected(products: pd.DataFrame, targets: pd.DataFrame) -> pd.
     return child_rows[["ID", "SKU", "Parent SKU", "Name"]].rename(columns={"ID": "ProductID"}).reset_index(drop=True)
 
 
-def _normal_target_gaps(products: pd.DataFrame, targets: pd.DataFrame, supplier_ids: pd.DataFrame, supplier_stock: pd.DataFrame, protection_rules: list[dict[str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _normal_target_gaps(
+    products: pd.DataFrame,
+    targets: pd.DataFrame,
+    supplier_ids: pd.DataFrame,
+    supplier_stock: pd.DataFrame,
+    protection_rules: list[dict[str, str]],
+    supplier_info_only_map: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     target_skus = {str(value).strip().casefold() for value in targets["SKU"].fillna("").astype(str) if str(value).strip()}
+    info_only_supplier_prefixes = _supplier_info_only_supplier_prefixes(supplier_info_only_map)
     rows = []
     quarantine = []
+    suppressed = []
     for _, product in products.iterrows():
         sku = str(product.get("SKU", "")).strip()
         parent_sku = str(product.get("Parent SKU", "")).strip()
         if not sku or sku.casefold() in target_skus or not parent_sku:
             continue
+        if _is_instock_sku(sku):
+            continue
         if _protected_by_rules(sku, parent_sku, protection_rules):
             continue
         matches = _exact_supplier_matches(sku, supplier_ids, supplier_stock)
         if len(matches) == 1:
+            if _is_supplier_info_only_family_base_sku(sku, matches[0], info_only_supplier_prefixes):
+                suppressed.append(_target_gap_row(product, matches[0], "supplier_info_only_manual_inventory", "raw supplier SKU family is controlled by supplier_info_only_sku_map.csv"))
+                continue
             rows.append(_target_row(product, matches[0]))
         elif len(matches) == 0:
             quarantine.append(_quarantine_from_product(product, "supplier_synced_inventory", "no_exact_supplier_feed_match_for_new_variant"))
         else:
             quarantine.append(_quarantine_from_product(product, "supplier_synced_inventory", "duplicate_supplier_feed_match_for_new_variant"))
-    return pd.DataFrame(rows, columns=TARGET_COLUMNS), pd.DataFrame(quarantine, columns=QUARANTINE_COLUMNS)
+    return (
+        pd.DataFrame(rows, columns=TARGET_COLUMNS),
+        pd.DataFrame(quarantine, columns=QUARANTINE_COLUMNS),
+        pd.DataFrame(suppressed, columns=TARGET_GAP_COLUMNS),
+    )
 
 
-def _supplier_info_only_gaps(products: pd.DataFrame, targets: pd.DataFrame, mapping: pd.DataFrame, supplier_stock: pd.DataFrame, protection_rules: list[dict[str, str]]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _supplier_info_only_gaps(
+    products: pd.DataFrame,
+    targets: pd.DataFrame,
+    mapping: pd.DataFrame,
+    supplier_ids: pd.DataFrame,
+    supplier_stock: pd.DataFrame,
+    protection_rules: list[dict[str, str]],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ready = []
     quarantine = []
     manual_needed = []
-    if mapping.empty:
-        return pd.DataFrame(columns=TARGET_COLUMNS), pd.DataFrame(columns=QUARANTINE_COLUMNS), pd.DataFrame(columns=["parent_sku", "child_sku", "parsed_internal_colour", "available_supplier_colour_candidates", "quarantine_reason"])
     target_keys = _target_lane_keys(targets)
+    planned_keys: set[tuple[str, str, str, str]] = set()
     by_sku = {str(row.get("SKU", "")).strip().casefold(): row for _, row in products.iterrows() if str(row.get("SKU", "")).strip()}
+    for _, product in products.iterrows():
+        sku = str(product.get("SKU", "")).strip()
+        if not _is_instock_sku(sku):
+            continue
+        base_sku = _instock_base_sku(sku)
+        if _is_numeric_parent_sku(base_sku):
+            quarantine.append(_quarantine_from_product(product, "supplier_info_only_manual_inventory", "instock_parent_or_aggregate"))
+            continue
+        candidate_rows = _instock_supplier_info_only_matches(product, supplier_ids, supplier_stock)
+        if len(candidate_rows) == 0:
+            quarantine.append(_quarantine_from_product(product, "supplier_info_only_manual_inventory", "instock_supplier_feed_match_missing"))
+            continue
+        if len(candidate_rows) > 1:
+            quarantine.append(_quarantine_from_product(product, "supplier_info_only_manual_inventory", "instock_supplier_feed_match_duplicate"))
+            continue
+        candidate = candidate_rows[0]
+        key = (sku.casefold(), str(candidate["supplier_sku"]).strip().casefold(), str(candidate["SupplierID"]).strip(), "supplier_info_only_manual_inventory")
+        if key in target_keys or key in planned_keys:
+            continue
+        ready.append(_supplier_info_only_target_row(product, candidate))
+        planned_keys.add(key)
+    if mapping.empty:
+        return pd.DataFrame(ready, columns=TARGET_COLUMNS), pd.DataFrame(quarantine, columns=QUARANTINE_COLUMNS), pd.DataFrame(columns=["parent_sku", "child_sku", "parsed_internal_colour", "available_supplier_colour_candidates", "quarantine_reason"])
     for _, row in mapping.iterrows():
         if str(row.get("stock_update_mode", "")).strip().casefold() != "supplier_info_only_manual_inventory":
             continue
@@ -500,9 +832,10 @@ def _supplier_info_only_gaps(products: pd.DataFrame, targets: pd.DataFrame, mapp
             continue
         candidate = candidate_rows[0]
         key = (child_sku.casefold(), str(candidate["supplier_sku"]).strip().casefold(), str(candidate["SupplierID"]).strip(), "supplier_info_only_manual_inventory")
-        if key in target_keys:
+        if key in target_keys or key in planned_keys:
             continue
         ready.append(_supplier_info_only_target_row(product, candidate))
+        planned_keys.add(key)
     protected = products[products["SKU"].fillna("").astype(str).map(lambda sku: any(_rule_matches(str(sku), "", rule) for rule in protection_rules))].copy()
     mapped_children = {str(value).strip().casefold() for value in mapping["child_sku"].fillna("").astype(str)}
     for _, product in protected.iterrows():
@@ -543,6 +876,61 @@ def _supplier_info_only_mapping_allows_target(target: pd.Series, mapping: pd.Dat
         & mapping["stock_update_mode"].fillna("").astype(str).str.strip().str.casefold().eq(mode)
     ]
     return len(rows) == 1
+
+
+def _is_instock_sku(sku: str) -> bool:
+    return str(sku).strip().upper().endswith("_INSTOCK")
+
+
+def _instock_base_sku(sku: str) -> str:
+    value = str(sku).strip()
+    return value[:-8] if value.upper().endswith("_INSTOCK") else value
+
+
+def _is_numeric_parent_sku(sku: str) -> bool:
+    value = str(sku).strip()
+    return bool(value) and value.isdigit()
+
+
+def _instock_supplier_info_only_matches(product: pd.Series, supplier_ids: pd.DataFrame, supplier_stock: pd.DataFrame) -> list[dict[str, Any]]:
+    sku = str(product.get("SKU", "")).strip()
+    if not _is_instock_sku(sku):
+        return []
+    base_sku = _instock_base_sku(sku)
+    if not base_sku or _is_numeric_parent_sku(base_sku):
+        return []
+    matches = _exact_supplier_matches(base_sku, supplier_ids, supplier_stock)
+    for match in matches:
+        match["supplier_sku"] = base_sku
+    return matches
+
+
+def _instock_target_allows_supplier_info_only(target: pd.Series) -> bool:
+    sku = str(target.get("SKU", "")).strip()
+    supplier_sku = str(target.get("SupplierSKU", "")).strip()
+    strategy = str(target.get("stock_strategy", "")).strip().casefold()
+    return (
+        strategy == "supplier_info_only_manual_inventory"
+        and _is_instock_sku(sku)
+        and supplier_sku.casefold() == _instock_base_sku(sku).casefold()
+        and not _is_numeric_parent_sku(_instock_base_sku(sku))
+    )
+
+
+def _instock_target_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows.copy()
+    return rows[rows["SKU"].fillna("").astype(str).map(_is_instock_sku)].copy()
+
+
+def _instock_quarantine_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows.copy()
+    reason = rows["reason"].fillna("").astype(str)
+    return rows[
+        rows["SKU"].fillna("").astype(str).map(_is_instock_sku)
+        | reason.str.contains("instock", case=False, na=False)
+    ].copy()
 
 
 def _target_lane_keys(targets: pd.DataFrame) -> set[tuple[str, str, str, str]]:
@@ -642,15 +1030,36 @@ def _summary(**kwargs: Any) -> pd.DataFrame:
         ("product_suppliers_missing_detected", len(kwargs["missing_supplier"])),
         ("product_suppliers_created", len(kwargs["created_supplier"])),
         ("target_rows_missing_detected", len(kwargs["target_missing"])),
+        ("supplier_info_only_family_base_targets_suppressed", len(kwargs.get("supplier_info_only_family_base_suppressed", []))),
         ("target_rows_appended", kwargs["appended_count"]),
         ("new_variants_detected", len(kwargs["new_variants"])),
         ("supplier_info_only_rows_ready", len(kwargs["info_ready"])),
         ("supplier_info_only_rows_appended", len(kwargs["info_appended"])),
+        ("instock_supplier_info_only_ready", len(_instock_target_rows(kwargs["info_ready"]))),
+        ("instock_supplier_info_only_appended", len(_instock_target_rows(kwargs["info_appended"]))),
+        ("instock_supplier_info_only_quarantine", len(_instock_quarantine_rows(kwargs["quarantine"]))),
+        ("instock_product_suppliers_created", int(kwargs["created_supplier"]["SKU"].fillna("").astype(str).map(_is_instock_sku).sum()) if not kwargs["created_supplier"].empty else 0),
+        ("invalid_target_cleanup_applied", "yes" if kwargs.get("invalid_cleanup_applied") else "no"),
+        ("invalid_targets_detected", _summary_metric(kwargs.get("invalid_cleanup"), "invalid_targets_detected")),
+        ("invalid_targets_repaired", _summary_metric(kwargs.get("invalid_cleanup"), "invalid_targets_repaired")),
+        ("invalid_targets_disabled", _summary_metric(kwargs.get("invalid_cleanup"), "invalid_targets_disabled")),
         ("manual_profile_mapping_needed_rows", len(kwargs["manual_profile_needed"])),
         ("quarantine_rows", len(kwargs["quarantine"])),
         ("safe_to_run_fast_sync", kwargs["safe_to_run_fast_sync"]),
     ]
     return pd.DataFrame([{"metric": metric, "value": value} for metric, value in rows], columns=SUMMARY_COLUMNS)
+
+
+def _summary_metric(summary: pd.DataFrame | None, metric: str) -> int:
+    if summary is None or summary.empty:
+        return 0
+    rows = summary[summary["metric"].astype(str).eq(metric)]
+    if rows.empty:
+        return 0
+    try:
+        return int(rows.iloc[0]["value"])
+    except (TypeError, ValueError):
+        return 0
 
 
 def _recommended_actions(quarantine: pd.DataFrame, manual_profile_needed: pd.DataFrame, safe_to_run_fast_sync: str) -> pd.DataFrame:
