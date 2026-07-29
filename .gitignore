@@ -43,3 +43,11 @@ backups/
 *.backup_*
 __pycache__/
 *.pyc
+
+# Python cache
+*.py[cod]
+
+# Temporary supplier diagnostics
+reports/updater_coverage_*/
+.env.local
+.pytest_cache/
