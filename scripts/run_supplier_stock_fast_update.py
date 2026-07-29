@@ -28,7 +28,7 @@ from src.storefeeder_api import (
     supplier_payload_preview_to_items,
 )
 from src.storefeeder_stock_export import read_csv
-from scripts.run_new_product_onboarding_delta import _load_products as _load_live_products
+from scripts.export_storefeeder_products import fetch_products
 
 
 TARGET_COLUMNS = [
@@ -191,7 +191,7 @@ def main() -> int:
 
     targets = _active_targets(read_csv(args.targets))
     client = StoreFeederApiClient.from_env(StoreFeederApiConfig(base_url=args.storefeeder_api_base_url))
-    live_products = _load_live_products(client, page_size=100, limit=None)
+    live_products = _load_live_products_for_reconciliation(client, page_size=100)
     product_id_reconciliation, product_id_quarantine, targets = _reconcile_runtime_product_ids(targets, live_products)
     if args.live_stock_update and not product_id_reconciliation.empty:
         _backup_and_write_targets(args.targets, targets, out_dir.name)
@@ -387,6 +387,26 @@ def main() -> int:
             f"zero_other_locations_failures={zero_location_update_failures}"
         )
     return 0
+
+
+def _load_live_products_for_reconciliation(client: StoreFeederApiClient, *, page_size: int) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for product in fetch_products(client, page_size=page_size, limit=None):
+        if not isinstance(product, dict):
+            continue
+        product_id = _first_text(product, ["ID", "Id", "ProductID", "ProductId"])
+        sku = _first_text(product, ["SKU", "Sku", "ProductSKU", "ProductSku"])
+        if product_id or sku:
+            rows.append({"ID": product_id, "SKU": sku})
+    return pd.DataFrame(rows, columns=["ID", "SKU"])
+
+
+def _first_text(payload: dict[str, Any], names: list[str]) -> str:
+    for name in names:
+        value = payload.get(name)
+        if value not in [None, ""]:
+            return str(value).strip()
+    return ""
 
 
 def _reconcile_runtime_product_ids(targets: pd.DataFrame, products: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
