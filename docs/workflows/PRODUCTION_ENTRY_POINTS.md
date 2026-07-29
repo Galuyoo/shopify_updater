@@ -10,8 +10,6 @@ These files are treated as operational entry points and must not be moved or sub
 | `scripts/run_new_product_onboarding_delta.py` | New-product onboarding workflow | Approved workflow |
 | `scripts/clean_product_setup_pipeline.py` | Clean product setup process | Approved workflow |
 | `scripts/product_family_pipeline.py` | Product-family processing | Approved workflow |
-| `scripts/clean_product_setup_pipeline.py` | Clean product setup process | Approved workflow |
-| `scripts/product_family_pipeline.py` | Product-family processing | Approved workflow |
 | `scripts/warehouse_stock_pipeline.py` | Warehouse inventory processing | Approved workflow |
 
 ## Change rule
