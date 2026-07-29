@@ -664,12 +664,11 @@ def build_fast_payload_preview(
         },
         columns=PAYLOAD_COLUMNS,
     )
-    stock_location_preview = _stock_location_payload_preview(valid)
-    if zero_other_locations_for_supplier_synced:
-        zero_location_preview, zero_location_safety_skips = _zero_other_locations_preview(valid)
-    else:
-        zero_location_preview = pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
-        zero_location_safety_skips = pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
+    # Supplier-inventory-only mode.
+    # Never modify StoreFeeder inventory or stock-location quantities.
+    stock_location_preview = pd.DataFrame(columns=STOCK_LOCATION_PAYLOAD_COLUMNS)
+    zero_location_preview = pd.DataFrame(columns=ZERO_LOCATION_PREVIEW_COLUMNS)
+    zero_location_safety_skips = pd.DataFrame(columns=ZERO_LOCATION_SAFETY_SKIP_COLUMNS)
     return (
         preview.reset_index(drop=True),
         stock_location_preview.reset_index(drop=True),
