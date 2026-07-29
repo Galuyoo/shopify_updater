@@ -22,9 +22,6 @@ data/maps/
 app/data/
 reports/amazon/
 *.csv
-!data/amazon_listing_map.example.csv
-!data/storefeeder_stock_location_ids.csv
-!data/storefeeder_supplier_ids.csv
 shopify_inventory_map_*.csv
 update_report_*.csv
 
@@ -32,17 +29,13 @@ update_report_*.csv
 app/utils/_state/
 
 data/logs/
-*.log
 utils/_reports/
 utils/_state/
 
-reports/amazon/
 data/amazon_export_raw.txt
 reports/
 backups/
 *.backup_*
-__pycache__/
-*.pyc
 
 # Python cache
 *.py[cod]
@@ -51,3 +44,11 @@ __pycache__/
 reports/updater_coverage_*/
 .env.local
 .pytest_cache/
+
+# Local editor history
+
+# Repository audit outputs
+reports/repository_audit/
+!data/amazon_listing_map.example.csv
+!data/storefeeder_stock_location_ids.csv
+!data/storefeeder_supplier_ids.csv
