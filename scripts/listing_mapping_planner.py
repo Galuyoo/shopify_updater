@@ -43,6 +43,7 @@ LISTING_COLUMNS = [
     "ASIN",
     "raw_json",
 ]
+LISTING_SOURCE_COLUMNS = LISTING_COLUMNS + ["source"]
 CANDIDATE_COLUMNS = [
     "Channel",
     "ListingID",
@@ -60,6 +61,33 @@ CANDIDATE_COLUMNS = [
     "reason",
 ]
 BLOCKER_COLUMNS = ["stage", "ListingID", "ListingSKU", "reason"]
+LOOKUP_DEBUG_COLUMNS = [
+    "lookup_value",
+    "lookup_type",
+    "found_yes_no",
+    "endpoint_source_used",
+    "channel",
+    "listing_id",
+    "channel_identifier",
+    "listing_sku",
+    "product_sku",
+    "mapping_status",
+    "reason_if_missing",
+]
+LISTING_FETCH_PAGE_COLUMNS = ["page", "status_code", "row_count", "first_listing_id", "last_listing_id", "channel_counts", "stop_reason"]
+ENDPOINT_PROBE_COLUMNS = ["endpoint", "params_json", "status_code", "row_count", "contains_lookup", "matched_terms", "reason"]
+OVERVIEW_ENDPOINT_PROBE_COLUMNS = [
+    "endpoint",
+    "params_json",
+    "status_code",
+    "row_count",
+    "contains_listing_sku",
+    "contains_channel_identifier",
+    "error_or_reason",
+    "sample_keys",
+    "detected_columns",
+]
+COVERAGE_SUMMARY_COLUMNS = ["metric", "value"]
 
 PRIORITY_PARENT_SKU = "EMB-CSTMINST-BC045"
 
@@ -77,12 +105,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--storefeeder-api-base-url", default="https://rest.storefeeder.com")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--page-size", type=int, default=100)
-    parser.add_argument("--max-pages", type=int, default=500)
+    parser.add_argument("--max-pages", type=int, default=None, help="Optional safety cap for paged API reads")
+    parser.add_argument("--fetch-all-listings", action="store_true")
+    parser.add_argument("--listing-filter-after-fetch", action="store_true")
+    parser.add_argument("--max-listing-rows", type=int, default=0, help="Optional listing row cap; 0 means no cap")
+    parser.add_argument("--no-raw-listings-report", dest="raw_listings_report", action="store_false")
+    parser.add_argument("--listing-sku", action="append", default=[], help="Targeted listing SKU lookup diagnostic")
+    parser.add_argument("--channel-identifier", action="append", default=[], help="Targeted channel identifier/ASIN lookup diagnostic")
+    parser.add_argument("--listing-id", action="append", default=[], help="Optional targeted listing ID/detail lookup diagnostic")
+    parser.add_argument("--listings-overview-export", type=Path, help="Optional StoreFeeder Listings Overview CSV export")
+    parser.add_argument("--overview-search-sku", action="append", default=[], help="Targeted Listings Overview SKU search diagnostic")
+    parser.add_argument("--overview-search-channel-identifier", action="append", default=[], help="Targeted Listings Overview ASIN/channel identifier search diagnostic")
+    parser.add_argument("--overview-search-parent", action="append", default=[], help="Targeted Listings Overview parent/family search diagnostic")
+    parser.set_defaults(raw_listings_report=True)
     args = parser.parse_args()
     if args.page_size < 1:
         parser.error("--page-size must be at least 1")
-    if args.max_pages < 1:
+    if args.max_pages is not None and args.max_pages < 1:
         parser.error("--max-pages must be at least 1")
+    if args.max_listing_rows < 0:
+        parser.error("--max-listing-rows must be zero or greater")
     return args
 
 
@@ -107,15 +149,75 @@ def _plan(args: argparse.Namespace, client: StoreFeederApiClient) -> int:
     _require_columns(manifest, MANIFEST_COLUMNS, str(args.manifest))
     manifest = _normalize_manifest(manifest)
 
-    products = _fetch_products(client, page_size=args.page_size, max_pages=args.max_pages)
+    products = _fetch_products(client, page_size=args.page_size, max_pages=args.max_pages or 500)
     product_index = _build_product_index(products)
     clean_products = _build_clean_products(client, manifest, product_index)
     clean_products_df = pd.DataFrame(clean_products, columns=PRODUCT_COLUMNS)
     _write_csv(clean_products_df, out_dir / "01_products.csv")
 
-    listings = _fetch_listings(client, args.channel, page_size=args.page_size, max_pages=args.max_pages)
-    listings_df = pd.DataFrame(listings, columns=LISTING_COLUMNS)
+    all_listings, listings, listing_fetch_meta, listing_fetch_pages = _fetch_listings(
+        client,
+        args.channel,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+        fetch_all=args.fetch_all_listings,
+        filter_after_fetch=args.listing_filter_after_fetch or args.fetch_all_listings,
+        max_listing_rows=args.max_listing_rows,
+    )
+    api_all_listings_df = pd.DataFrame(all_listings, columns=LISTING_COLUMNS)
+    overview_listings_df = _load_listings_overview_export(args.listings_overview_export)
+    overview_probe_results, overview_lookup_debug, overview_fetch_pages, overview_probe_listings_df = _probe_overview_sources(
+        client,
+        search_skus=args.overview_search_sku,
+        channel_identifiers=args.overview_search_channel_identifier,
+        parent_terms=args.overview_search_parent,
+        channel=args.channel,
+    )
+    if not overview_probe_listings_df.empty:
+        overview_listings_df = pd.concat([overview_listings_df, overview_probe_listings_df], ignore_index=True)
+    if args.listings_overview_export:
+        _write_csv(overview_listings_df, out_dir / "listing_overview_export_normalized.csv")
+    elif not overview_listings_df.empty:
+        _write_csv(overview_listings_df, out_dir / "listing_overview_export_normalized.csv")
+    all_listings_df = _combine_listing_sources(api_all_listings_df, overview_listings_df)
+    listings_df = all_listings_df[all_listings_df.apply(lambda row: _channel_matches(row.to_dict(), args.channel), axis=1)].copy()
+    listings_df = listings_df.reindex(columns=LISTING_SOURCE_COLUMNS, fill_value="")
+    if args.raw_listings_report:
+        _write_csv(all_listings_df, out_dir / "02_all_listings_raw.csv")
     _write_csv(listings_df, out_dir / "02_listings.csv")
+    unique_channels = _unique_listing_channels(all_listings_df)
+    search_hits = _listing_channel_search_hits(all_listings_df)
+    _write_csv(unique_channels, out_dir / "unique_listing_channels.csv")
+    _write_csv(search_hits, out_dir / "listing_channel_search_hits.csv")
+    _write_csv(pd.DataFrame(listing_fetch_pages, columns=LISTING_FETCH_PAGE_COLUMNS), out_dir / "listing_fetch_pages.csv")
+    endpoint_probe_results = _probe_listing_endpoints(
+        client,
+        listing_skus=args.listing_sku,
+        channel_identifiers=args.channel_identifier,
+        channel=args.channel,
+    )
+    _write_csv(endpoint_probe_results, out_dir / "listing_endpoint_probe_results.csv")
+    _write_csv(overview_probe_results, out_dir / "overview_endpoint_probe_results.csv")
+    _write_csv(overview_lookup_debug, out_dir / "overview_lookup_debug.csv")
+    _write_csv(overview_fetch_pages, out_dir / "overview_fetch_pages.csv")
+    lookup_debug = _listing_lookup_debug(
+        client,
+        all_listings_df.to_dict("records"),
+        listing_skus=args.listing_sku,
+        channel_identifiers=args.channel_identifier,
+        listing_ids=args.listing_id,
+    )
+    _write_csv(lookup_debug, out_dir / "listing_lookup_debug.csv")
+    coverage_summary = _listing_source_coverage_summary(
+        api_all_listings_df,
+        overview_listings_df,
+        listings_df,
+        lookup_debug,
+        endpoint_probe_results,
+        overview_probe_results=overview_probe_results,
+        overview_lookup_debug=overview_lookup_debug,
+    )
+    _write_csv(coverage_summary, out_dir / "listing_source_coverage_summary.csv")
 
     candidates, blockers = _build_mapping_candidates(listings_df, clean_products_df, args.channel)
     candidates_df = pd.DataFrame(candidates, columns=CANDIDATE_COLUMNS)
@@ -135,6 +237,22 @@ def _plan(args: argparse.Namespace, client: StoreFeederApiClient) -> int:
         {"metric": "supplier_synced_product_rows", "value": _count_eq(clean_products_df, "stock_strategy", "supplier_synced_inventory")},
         {"metric": "warehouse_only_product_rows", "value": _count_eq(clean_products_df, "stock_strategy", "warehouse_only")},
         {"metric": "listing_rows", "value": len(listings_df)},
+        {"metric": "total_listing_rows_fetched", "value": len(all_listings_df)},
+        {"metric": "filtered_listing_rows", "value": len(listings_df)},
+        {"metric": "unique_channel_count", "value": len(unique_channels)},
+        {"metric": "fetch_all_listings", "value": "yes" if args.fetch_all_listings else "no"},
+        {"metric": "listing_pages_scanned", "value": listing_fetch_meta.get("pages_scanned", 0)},
+        {"metric": "listing_fetch_stop_reason", "value": listing_fetch_meta.get("stop_reason", "")},
+        {"metric": "targeted_lookup_rows", "value": len(lookup_debug)},
+        {"metric": "targeted_lookup_found_rows", "value": _count_eq(lookup_debug, "found_yes_no", "yes")},
+        {"metric": "api_listing_rows", "value": len(api_all_listings_df)},
+        {"metric": "overview_export_listing_rows", "value": len(overview_listings_df)},
+        {"metric": "endpoint_probe_rows", "value": len(endpoint_probe_results)},
+        {"metric": "endpoint_probe_contains_lookup_rows", "value": _count_eq(endpoint_probe_results, "contains_lookup", "yes")},
+        {"metric": "overview_endpoint_probe_rows", "value": len(overview_probe_results)},
+        {"metric": "overview_endpoint_probe_contains_listing_sku_rows", "value": _count_eq(overview_probe_results, "contains_listing_sku", "yes")},
+        {"metric": "overview_endpoint_probe_contains_channel_identifier_rows", "value": _count_eq(overview_probe_results, "contains_channel_identifier", "yes")},
+        {"metric": "overview_lookup_found_rows", "value": _count_eq(overview_lookup_debug, "found_yes_no", "yes")},
         {"metric": "candidate_rows", "value": len(candidates_df)},
         {"metric": "mapping_manifest_ready_rows", "value": len(ready_df)},
         {"metric": "blocker_rows", "value": len(blockers_df)},
@@ -159,7 +277,16 @@ def _verify(args: argparse.Namespace, client: StoreFeederApiClient) -> int:
     out_dir = args.out_root / f"verify_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = _read_csv(manifest_path)
-    listings = pd.DataFrame(_fetch_listings(client, args.channel, page_size=args.page_size, max_pages=args.max_pages), columns=LISTING_COLUMNS)
+    _, filtered_listings, _, _ = _fetch_listings(
+        client,
+        args.channel,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+        fetch_all=args.fetch_all_listings,
+        filter_after_fetch=args.listing_filter_after_fetch or args.fetch_all_listings,
+        max_listing_rows=args.max_listing_rows,
+    )
+    listings = pd.DataFrame(filtered_listings, columns=LISTING_COLUMNS)
     current_by_id = {str(row["ListingID"]): row for _, row in listings.iterrows()}
     rows = []
     for _, row in manifest.iterrows():
@@ -358,32 +485,589 @@ def _fetch_products(client: StoreFeederApiClient, *, page_size: int, max_pages: 
     return products
 
 
-def _fetch_listings(client: StoreFeederApiClient, channel: str, *, page_size: int, max_pages: int) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
+def _fetch_listings(
+    client: StoreFeederApiClient,
+    channel: str,
+    *,
+    page_size: int,
+    max_pages: int | None,
+    fetch_all: bool,
+    filter_after_fetch: bool,
+    max_listing_rows: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    all_rows: list[dict[str, Any]] = []
+    filtered_rows: list[dict[str, Any]] = []
+    page_rows: list[dict[str, Any]] = []
+    page = 1
+    stop_reason = "not_started"
+    while True:
+        if max_pages is not None and page > max_pages:
+            stop_reason = "max_pages_reached"
+            break
         wrapper = client.get_path("/listings", params={"page": page, "pageSize": page_size})
-        if int(wrapper.get("_status_code", 0)) >= 400:
+        status_code = int(wrapper.get("_status_code", 0))
+        if status_code >= 400:
+            stop_reason = f"http_{status_code}"
+            page_rows.append(_listing_fetch_page_row(page, status_code, [], stop_reason))
             break
         payload = wrapper.get("response", {})
         items = _extract_records(payload)
         if not items:
+            stop_reason = "empty_page"
+            page_rows.append(_listing_fetch_page_row(page, status_code, [], stop_reason))
+            print(f"listings page {page}: 0 scanned, total {len(all_rows)}", flush=True)
             break
+        page_listing_rows = [_listing_row(item) for item in items]
         for item in items:
             row = _listing_row(item)
-            if _channel_matches(row, channel):
-                rows.append(row)
-        print(f"listings page {page}: {len(items)} scanned, {len(rows)} kept", flush=True)
-        if _is_last_page(payload, page, page_size, len(items)):
+            all_rows.append(row)
+            if not filter_after_fetch and _channel_matches(row, channel):
+                filtered_rows.append(row)
+            if max_listing_rows and len(all_rows) >= max_listing_rows:
+                stop_reason = "max_listing_rows_reached"
+                break
+        print(f"listings page {page}: {len(items)} scanned, total {len(all_rows)}", flush=True)
+        if stop_reason == "max_listing_rows_reached":
+            page_rows.append(_listing_fetch_page_row(page, status_code, page_listing_rows, stop_reason))
             break
-    return rows
+        if len(items) < page_size:
+            stop_reason = "short_page"
+            page_rows.append(_listing_fetch_page_row(page, status_code, page_listing_rows, stop_reason))
+            break
+        if not fetch_all and _is_last_page(payload, page, page_size, len(items)):
+            stop_reason = "api_last_page"
+            page_rows.append(_listing_fetch_page_row(page, status_code, page_listing_rows, stop_reason))
+            break
+        page_rows.append(_listing_fetch_page_row(page, status_code, page_listing_rows, ""))
+        page += 1
+    if filter_after_fetch:
+        filtered_rows = [row for row in all_rows if _channel_matches(row, channel)]
+    meta = {"pages_scanned": page if stop_reason != "not_started" else 0, "stop_reason": stop_reason}
+    if page_rows and not page_rows[-1].get("stop_reason"):
+        page_rows[-1]["stop_reason"] = stop_reason
+    return all_rows, filtered_rows, meta, page_rows
+
+
+def _combine_listing_sources(api_listings: pd.DataFrame, overview_listings: pd.DataFrame) -> pd.DataFrame:
+    api = api_listings.copy()
+    if api.empty:
+        api = pd.DataFrame(columns=LISTING_COLUMNS)
+    api["source"] = "/listings"
+    overview = overview_listings.copy()
+    if overview.empty:
+        overview = pd.DataFrame(columns=LISTING_SOURCE_COLUMNS)
+    for frame in [api, overview]:
+        for column in LISTING_SOURCE_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = ""
+    combined = pd.concat([api[LISTING_SOURCE_COLUMNS], overview[LISTING_SOURCE_COLUMNS]], ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame(columns=LISTING_SOURCE_COLUMNS)
+    return combined.drop_duplicates(subset=["source", "ListingID", "ListingSKU", "ASIN", "raw_json"], keep="first").reset_index(drop=True)
+
+
+def _load_listings_overview_export(path: Path | None) -> pd.DataFrame:
+    if not path:
+        return pd.DataFrame(columns=LISTING_SOURCE_COLUMNS)
+    if not path.exists():
+        raise SystemExit(f"Listings Overview export not found: {path}")
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    rows = []
+    for _, item in df.iterrows():
+        payload = item.to_dict()
+        row = {
+            "Channel": _first_text(payload, ["Channel", "Channel Name", "Sales Channel", "Marketplace"]),
+            "ListingID": _first_text(payload, ["ListingID", "Listing ID", "ID", "Id"]),
+            "ListingVariantID": _first_text(payload, ["ListingVariantID", "Listing Variant ID", "VariantID", "Variant ID"]),
+            "ListingSKU": _first_text(payload, ["Listing SKU", "ListingSKU", "SKU", "Channel SKU", "Seller SKU"]),
+            "ListingTitle": _first_text(payload, ["Title", "Listing Title", "Name", "Product Name"]),
+            "CurrentProductID": _first_text(payload, ["ProductID", "Product ID", "StoreFeeder Product ID", "Mapped Product ID"]),
+            "CurrentProductSKU": _first_text(payload, ["Product SKU", "ProductSKU", "Mapped Product SKU", "StoreFeeder SKU"]),
+            "ListingStatus": _first_text(payload, ["Status", "Listing Status", "Mapping Status"]),
+            "Marketplace": _first_text(payload, ["Marketplace", "Market Place"]),
+            "ASIN": _first_text(payload, ["ASIN", "Channel Identifier", "ChannelIdentifier", "Channel ID"]),
+            "raw_json": json.dumps(payload, default=str, ensure_ascii=False),
+            "source": f"ui_export:{path}",
+        }
+        rows.append(row)
+    return pd.DataFrame(rows, columns=LISTING_SOURCE_COLUMNS)
+
+
+def _probe_listing_endpoints(
+    client: StoreFeederApiClient,
+    *,
+    listing_skus: list[str],
+    channel_identifiers: list[str],
+    channel: str,
+) -> pd.DataFrame:
+    lookup_terms = [value for value in [*listing_skus, *channel_identifiers, channel] if str(value).strip()]
+    if not lookup_terms:
+        return pd.DataFrame(columns=ENDPOINT_PROBE_COLUMNS)
+    probes: list[tuple[str, dict[str, Any]]] = []
+    endpoints = ["/listings", "/channel-listings", "/channellistings", "/channel/listings", "/amazon/listings"]
+    for endpoint in endpoints:
+        probes.append((endpoint, {"page": 1, "pageSize": 100}))
+        for sku in listing_skus:
+            if not str(sku).strip():
+                continue
+            probes.extend(
+                [
+                    (endpoint, {"page": 1, "pageSize": 100, "sku": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "SKU": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "listingSku": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "search": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "q": sku}),
+                ]
+            )
+        for identifier in channel_identifiers:
+            if not str(identifier).strip():
+                continue
+            probes.extend(
+                [
+                    (endpoint, {"page": 1, "pageSize": 100, "asin": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "ASIN": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "channelIdentifier": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "search": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "q": identifier}),
+                ]
+            )
+        if channel:
+            probes.extend(
+                [
+                    (endpoint, {"page": 1, "pageSize": 100, "channel": channel}),
+                    (endpoint, {"page": 1, "pageSize": 100, "channelName": channel}),
+                    (endpoint, {"page": 1, "pageSize": 100, "marketplace": channel}),
+                    (endpoint, {"page": 1, "pageSize": 100, "mapped": "false"}),
+                    (endpoint, {"page": 1, "pageSize": 100, "unmapped": "true"}),
+                    (endpoint, {"page": 1, "pageSize": 100, "productSku": "Undefined"}),
+                    (endpoint, {"page": 1, "pageSize": 100, "includeInactive": "true"}),
+                ]
+            )
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    for endpoint, params in probes:
+        key = (endpoint, json.dumps(params, sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            wrapper = client.get_path(endpoint, params=params)
+            status = int(wrapper.get("_status_code", 0))
+            payload = wrapper.get("response", {})
+            raw = json.dumps(payload, default=str, ensure_ascii=False)
+            records = _extract_records(payload)
+            matched_terms = [term for term in lookup_terms if term.casefold() in raw.casefold()]
+            rows.append(
+                {
+                    "endpoint": endpoint,
+                    "params_json": json.dumps(params, sort_keys=True),
+                    "status_code": status,
+                    "row_count": len(records),
+                    "contains_lookup": "yes" if matched_terms else "no",
+                    "matched_terms": "|".join(matched_terms),
+                    "reason": "" if status < 400 else f"http_{status}",
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "endpoint": endpoint,
+                    "params_json": json.dumps(params, sort_keys=True),
+                    "status_code": "",
+                    "row_count": 0,
+                    "contains_lookup": "no",
+                    "matched_terms": "",
+                    "reason": f"exception:{exc}",
+                }
+            )
+    return pd.DataFrame(rows, columns=ENDPOINT_PROBE_COLUMNS)
+
+
+def _probe_overview_sources(
+    client: StoreFeederApiClient,
+    *,
+    search_skus: list[str],
+    channel_identifiers: list[str],
+    parent_terms: list[str],
+    channel: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    lookup_skus = [str(value).strip() for value in [*search_skus, *parent_terms] if str(value).strip()]
+    lookup_identifiers = [str(value).strip() for value in channel_identifiers if str(value).strip()]
+    if not lookup_skus and not lookup_identifiers:
+        return (
+            pd.DataFrame(columns=OVERVIEW_ENDPOINT_PROBE_COLUMNS),
+            pd.DataFrame(columns=LOOKUP_DEBUG_COLUMNS),
+            pd.DataFrame(columns=LISTING_FETCH_PAGE_COLUMNS),
+            pd.DataFrame(columns=LISTING_SOURCE_COLUMNS),
+        )
+    endpoints = [
+        "/listings/overview",
+        "/Listings/Overview",
+        "/Listings/Overview.aspx",
+        "/listings/search",
+        "/Listings/Search",
+        "/listing-overview",
+        "/listingoverview",
+        "/channel-listings",
+        "/channel-listings/search",
+        "/channellistings",
+        "/channellistings/search",
+        "/marketplace-listings",
+        "/marketplace-listings/search",
+        "/marketplacelistings",
+        "/amazon/listings",
+        "/amazon/listings/search",
+    ]
+    probes: list[tuple[str, dict[str, Any]]] = []
+    for endpoint in endpoints:
+        base_params = {"page": 1, "pageSize": 100}
+        probes.append((endpoint, base_params))
+        for sku in lookup_skus:
+            probes.extend(
+                [
+                    (endpoint, {"page": 1, "pageSize": 100, "sku": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "SKU": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "listingSku": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "listingSKU": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "search": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "q": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "parent": sku}),
+                    (endpoint, {"page": 1, "pageSize": 100, "parentSku": sku}),
+                ]
+            )
+        for identifier in lookup_identifiers:
+            probes.extend(
+                [
+                    (endpoint, {"page": 1, "pageSize": 100, "asin": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "ASIN": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "channelIdentifier": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "channel_identifier": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "search": identifier}),
+                    (endpoint, {"page": 1, "pageSize": 100, "q": identifier}),
+                ]
+            )
+        probes.extend(
+            [
+                (endpoint, {"page": 1, "pageSize": 100, "channel": channel}),
+                (endpoint, {"page": 1, "pageSize": 100, "channelName": channel}),
+                (endpoint, {"page": 1, "pageSize": 100, "marketplace": channel}),
+                (endpoint, {"page": 1, "pageSize": 100, "mapped": "false"}),
+                (endpoint, {"page": 1, "pageSize": 100, "unmapped": "true"}),
+                (endpoint, {"page": 1, "pageSize": 100, "mappingStatus": "unmapped"}),
+                (endpoint, {"page": 1, "pageSize": 100, "productSku": "Undefined"}),
+                (endpoint, {"page": 1, "pageSize": 100, "productSKU": "Undefined"}),
+                (endpoint, {"page": 1, "pageSize": 100, "includeInactive": "true"}),
+                (endpoint, {"page": 1, "pageSize": 100, "includeControlled": "true"}),
+                (endpoint, {"page": 1, "pageSize": 100, "includeDiscontinued": "true"}),
+            ]
+        )
+    probe_rows: list[dict[str, Any]] = []
+    lookup_rows: list[dict[str, Any]] = []
+    fetch_page_rows: list[dict[str, Any]] = []
+    normalized_rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for endpoint, params in probes:
+        key = (endpoint, json.dumps(params, sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        status_code = ""
+        records: list[dict[str, Any]] = []
+        raw = ""
+        reason = ""
+        try:
+            wrapper = client.get_path(endpoint, params=params)
+            status_code = int(wrapper.get("_status_code", 0))
+            payload = wrapper.get("response", {})
+            raw = json.dumps(payload, default=str, ensure_ascii=False)
+            records = _extract_records(payload)
+            if not records and isinstance(payload, dict) and status_code < 400:
+                records = [payload]
+            reason = "" if status_code < 400 else f"http_{status_code}"
+        except Exception as exc:
+            reason = f"exception:{exc}"
+        contains_sku = any(term.casefold() in raw.casefold() for term in lookup_skus)
+        contains_identifier = any(term.casefold() in raw.casefold() for term in lookup_identifiers)
+        sample_keys, detected_columns = _record_shape(records)
+        probe_rows.append(
+            {
+                "endpoint": endpoint,
+                "params_json": json.dumps(params, sort_keys=True),
+                "status_code": status_code,
+                "row_count": len(records),
+                "contains_listing_sku": "yes" if contains_sku else "no",
+                "contains_channel_identifier": "yes" if contains_identifier else "no",
+                "error_or_reason": reason,
+                "sample_keys": sample_keys,
+                "detected_columns": detected_columns,
+            }
+        )
+        fetch_page_rows.append(
+            _listing_fetch_page_row(
+                len(fetch_page_rows) + 1,
+                int(status_code) if str(status_code).isdigit() else 0,
+                [_listing_row(record) for record in records if isinstance(record, dict)],
+                reason,
+            )
+        )
+        if not (contains_sku or contains_identifier):
+            continue
+        for record in records:
+            row = _listing_row(record)
+            row["source"] = f"overview_probe:{endpoint}"
+            normalized_rows.append(row)
+            for value in lookup_skus:
+                if value.casefold() in json.dumps(record, default=str, ensure_ascii=False).casefold():
+                    lookup_rows.append(_listing_lookup_row(value, "overview_search_sku", row, row["source"], ""))
+            for value in lookup_identifiers:
+                if value.casefold() in json.dumps(record, default=str, ensure_ascii=False).casefold():
+                    lookup_rows.append(_listing_lookup_row(value, "overview_search_channel_identifier", row, row["source"], ""))
+    if not lookup_rows:
+        for value in lookup_skus:
+            lookup_rows.append(_overview_missing_lookup_row(value, "overview_search_sku"))
+        for value in lookup_identifiers:
+            lookup_rows.append(_overview_missing_lookup_row(value, "overview_search_channel_identifier"))
+    return (
+        pd.DataFrame(probe_rows, columns=OVERVIEW_ENDPOINT_PROBE_COLUMNS),
+        pd.DataFrame(lookup_rows, columns=LOOKUP_DEBUG_COLUMNS),
+        pd.DataFrame(fetch_page_rows, columns=LISTING_FETCH_PAGE_COLUMNS),
+        pd.DataFrame(normalized_rows, columns=LISTING_SOURCE_COLUMNS),
+    )
+
+
+def _record_shape(records: list[dict[str, Any]]) -> tuple[str, str]:
+    if not records:
+        return "", ""
+    sample = records[0]
+    if not isinstance(sample, dict):
+        return "", ""
+    keys = sorted(str(key) for key in sample.keys())
+    detected = [key for key in keys if any(token in key.casefold() for token in ["sku", "asin", "channel", "listing", "product", "mapped", "status"])]
+    return "|".join(keys[:40]), "|".join(detected[:40])
+
+
+def _overview_missing_lookup_row(value: str, lookup_type: str) -> dict[str, Any]:
+    return {
+        "lookup_value": value,
+        "lookup_type": lookup_type,
+        "found_yes_no": "no",
+        "endpoint_source_used": "overview endpoint probes",
+        "channel": "",
+        "listing_id": "",
+        "channel_identifier": "",
+        "listing_sku": "",
+        "product_sku": "",
+        "mapping_status": "",
+        "reason_if_missing": "not_found_in_overview_endpoint_probes",
+    }
 
 
 def _channel_matches(row: dict[str, str], channel: str) -> bool:
     if not channel:
         return True
-    text = " ".join([row.get("Channel", ""), row.get("Marketplace", ""), row.get("raw_json", "")]).casefold()
-    return channel.casefold() in text
+    channel_key = channel.casefold().strip()
+    exact_fields = [
+        row.get("Channel", ""),
+        row.get("Marketplace", ""),
+    ]
+    if any(str(value).casefold().strip() == channel_key for value in exact_fields):
+        return True
+    text = " ".join(
+        [
+            row.get("Channel", ""),
+            row.get("Marketplace", ""),
+            row.get("ListingTitle", ""),
+            row.get("raw_json", ""),
+        ]
+    ).casefold()
+    return channel_key in text
 
+
+def _listing_fetch_page_row(page: int, status_code: int, rows: list[dict[str, str]], stop_reason: str) -> dict[str, Any]:
+    ids = [str(row.get("ListingID", "")).strip() for row in rows if str(row.get("ListingID", "")).strip()]
+    counts: dict[str, int] = {}
+    for row in rows:
+        channel = str(row.get("Channel", "")).strip() or "(blank)"
+        marketplace = str(row.get("Marketplace", "")).strip()
+        key = channel if not marketplace else f"{channel} / {marketplace}"
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "page": page,
+        "status_code": status_code,
+        "row_count": len(rows),
+        "first_listing_id": ids[0] if ids else "",
+        "last_listing_id": ids[-1] if ids else "",
+        "channel_counts": json.dumps(counts, ensure_ascii=False, sort_keys=True),
+        "stop_reason": stop_reason,
+    }
+
+
+def _listing_lookup_debug(
+    client: StoreFeederApiClient,
+    all_listings: list[dict[str, Any]],
+    *,
+    listing_skus: list[str],
+    channel_identifiers: list[str],
+    listing_ids: list[str],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    lookups = []
+    lookups.extend(("listing_sku", value) for value in listing_skus if str(value).strip())
+    lookups.extend(("channel_identifier", value) for value in channel_identifiers if str(value).strip())
+    lookups.extend(("listing_id", value) for value in listing_ids if str(value).strip())
+    for lookup_type, value in lookups:
+        matches = _listing_lookup_matches(all_listings, lookup_type, value, "/listings paged fetch")
+        if lookup_type == "listing_id":
+            matches.extend(_listing_detail_lookup(client, value))
+        if matches:
+            rows.extend(matches)
+        else:
+            rows.append(
+                {
+                    "lookup_value": value,
+                    "lookup_type": lookup_type,
+                    "found_yes_no": "no",
+                    "endpoint_source_used": "/listings paged fetch" if lookup_type != "listing_id" else "/listings paged fetch + detail probes",
+                    "channel": "",
+                    "listing_id": "",
+                    "channel_identifier": "",
+                    "listing_sku": "",
+                    "product_sku": "",
+                    "mapping_status": "",
+                    "reason_if_missing": "not_found_in_fetched_listing_source",
+                }
+            )
+    return pd.DataFrame(rows, columns=LOOKUP_DEBUG_COLUMNS)
+
+
+def _listing_lookup_matches(listings: list[dict[str, Any]], lookup_type: str, value: str, source: str) -> list[dict[str, Any]]:
+    key = str(value).strip().casefold()
+    rows = []
+    for row in listings:
+        row_text = str(row.get("raw_json", "")).casefold()
+        if lookup_type == "listing_sku":
+            matched = str(row.get("ListingSKU", "")).strip().casefold() == key or key in row_text
+        elif lookup_type == "channel_identifier":
+            matched = (
+                str(row.get("ASIN", "")).strip().casefold() == key
+                or key in row_text
+            )
+        else:
+            matched = str(row.get("ListingID", "")).strip().casefold() == key or key in row_text
+        if matched:
+            rows.append(_listing_lookup_row(value, lookup_type, row, source, ""))
+    return rows
+
+
+def _listing_detail_lookup(client: StoreFeederApiClient, listing_id: str) -> list[dict[str, Any]]:
+    rows = []
+    for path in [f"/listings/{listing_id}", f"/channel-listings/{listing_id}", f"/channellistings/{listing_id}"]:
+        wrapper = client.get_path(path)
+        status = int(wrapper.get("_status_code", 0))
+        if status >= 400:
+            continue
+        records = _extract_records(wrapper.get("response", {}))
+        if not records and isinstance(wrapper.get("response"), dict):
+            records = [wrapper["response"]]
+        for record in records:
+            row = _listing_row(record)
+            rows.append(_listing_lookup_row(listing_id, "listing_id", row, f"GET {path}", ""))
+    return rows
+
+
+def _listing_lookup_row(value: str, lookup_type: str, row: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
+    source_used = str(row.get("source", "")).strip() or source
+    return {
+        "lookup_value": value,
+        "lookup_type": lookup_type,
+        "found_yes_no": "yes",
+        "endpoint_source_used": source_used,
+        "channel": row.get("Channel", ""),
+        "listing_id": row.get("ListingID", ""),
+        "channel_identifier": row.get("ASIN", "") or _raw_first_text(row.get("raw_json", ""), ["ChannelIdentifier", "Channel Identifier", "ASIN", "asin"]),
+        "listing_sku": row.get("ListingSKU", ""),
+        "product_sku": row.get("CurrentProductSKU", ""),
+        "mapping_status": _mapping_status(row),
+        "reason_if_missing": reason,
+    }
+
+
+def _raw_first_text(raw_json: str, keys: list[str]) -> str:
+    try:
+        payload = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return ""
+    return _first_text(payload, keys)
+
+
+def _mapping_status(row: dict[str, Any]) -> str:
+    current_product_sku = str(row.get("CurrentProductSKU", "")).strip()
+    current_product_id = str(row.get("CurrentProductID", "")).strip()
+    raw = str(row.get("raw_json", "")).casefold()
+    if current_product_sku or current_product_id:
+        return "mapped"
+    if "create-map" in raw or "unmapped" in raw or "undefined" in raw:
+        return "unmapped"
+    return ""
+
+
+def _listing_source_coverage_summary(
+    api_listings: pd.DataFrame,
+    overview_listings: pd.DataFrame,
+    filtered_listings: pd.DataFrame,
+    lookup_debug: pd.DataFrame,
+    endpoint_probe_results: pd.DataFrame,
+    *,
+    overview_probe_results: pd.DataFrame,
+    overview_lookup_debug: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = [
+        {"metric": "api_listing_rows", "value": len(api_listings)},
+        {"metric": "overview_export_listing_rows", "value": len(overview_listings)},
+        {"metric": "combined_listing_rows", "value": len(api_listings) + len(overview_listings)},
+        {"metric": "filtered_listing_rows", "value": len(filtered_listings)},
+        {"metric": "targeted_lookup_rows", "value": len(lookup_debug)},
+        {"metric": "targeted_lookup_found_rows", "value": _count_eq(lookup_debug, "found_yes_no", "yes")},
+        {"metric": "endpoint_probe_rows", "value": len(endpoint_probe_results)},
+        {"metric": "endpoint_probe_contains_lookup_rows", "value": _count_eq(endpoint_probe_results, "contains_lookup", "yes")},
+        {"metric": "overview_endpoint_probe_rows", "value": len(overview_probe_results)},
+        {"metric": "overview_endpoint_contains_listing_sku_rows", "value": _count_eq(overview_probe_results, "contains_listing_sku", "yes")},
+        {"metric": "overview_endpoint_contains_channel_identifier_rows", "value": _count_eq(overview_probe_results, "contains_channel_identifier", "yes")},
+        {"metric": "overview_lookup_rows", "value": len(overview_lookup_debug)},
+        {"metric": "overview_lookup_found_rows", "value": _count_eq(overview_lookup_debug, "found_yes_no", "yes")},
+    ]
+    if not lookup_debug.empty:
+        missing = lookup_debug[lookup_debug["found_yes_no"].astype(str).str.casefold().eq("no")]
+        rows.append({"metric": "targeted_lookup_missing_rows", "value": len(missing)})
+    return pd.DataFrame(rows, columns=COVERAGE_SUMMARY_COLUMNS)
+
+
+def _unique_listing_channels(listings: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Channel", "Marketplace", "count"]
+    if listings.empty:
+        return pd.DataFrame(columns=columns)
+    rows = listings.copy()
+    for column in ["Channel", "Marketplace"]:
+        if column not in rows.columns:
+            rows[column] = ""
+        rows[column] = rows[column].fillna("").astype(str).str.strip()
+    return rows.groupby(["Channel", "Marketplace"], dropna=False).size().reset_index(name="count").sort_values("count", ascending=False).reset_index(drop=True)
+
+
+def _listing_channel_search_hits(listings: pd.DataFrame) -> pd.DataFrame:
+    if listings.empty:
+        return pd.DataFrame(columns=LISTING_COLUMNS + ["matched_terms"])
+    terms = ["Custom", "Side", "CustomSide", "Amazon"]
+    rows = []
+    for _, row in listings.iterrows():
+        raw = str(row.get("raw_json", ""))
+        matched = [term for term in terms if term.casefold() in raw.casefold()]
+        if not matched:
+            continue
+        out = {column: row.get(column, "") for column in LISTING_COLUMNS}
+        out["matched_terms"] = "|".join(matched)
+        rows.append(out)
+    return pd.DataFrame(rows, columns=LISTING_COLUMNS + ["matched_terms"])
 
 def _build_product_index(products: list[dict[str, Any]]) -> dict[str, Any]:
     by_sku: dict[str, list[dict[str, str]]] = {}
