@@ -306,3 +306,4 @@ For every extraction:
 4. Compare generated DataFrames, CSV columns, row counts, skip reasons, and payload dictionaries.
 5. Commit architectural movement separately from rule changes.
 6. Do not copy logic from historical scripts.
+
