@@ -10,6 +10,8 @@ from store_profiles import STORE_PROFILES
 from config import SLEEP_HOURS, BATCH_SIZE, DAYS_BACK, DRY_RUN, LOG_DIR
 from utils.emailer import send_email, maybe_gzip_csv
 from stock_sources import build_combined_stock_df  # ✅ NEW
+from metrics import log_event
+from uuid import uuid4
 
 IGNORE_STORES = {"paddywear"}  # or {"store1", "store2"}
 
@@ -71,6 +73,9 @@ def run_forever():
     while True:
         cycle += 1
         _log_line(f"🔁 ===== Cycle {cycle} start =====")
+        cycle_id = str(uuid4())
+        cycle_started = time.perf_counter()
+        log_event("inventory_cycle_started", cycle_id=cycle_id, metadata={"store_count": len(stores), "dry_run": bool(DRY_RUN)})
 
         cycle_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
         attachments = []
@@ -83,12 +88,16 @@ def run_forever():
             _cycle_stock_df = build_combined_stock_df(prefer="ralawise", progress=_progress_cb)
             _progress_cb(f"✅ Stock feeds ready for cycle (rows={len(_cycle_stock_df)})")
         except Exception as e:
+            log_event("stock_fetch_failed", status="failure", cycle_id=cycle_id, error=e)
             _log_line(f"❌ Stock fetch failed for cycle {cycle}: {type(e).__name__}: {e}")
             _log_line(traceback.format_exc())
             # Fallback: run_update will fetch stock internally (old behavior)
 
         for store_key in stores:
             _log_line(f"🏪 Store: {store_key}")
+            workflow_id = f"{cycle_id}:{store_key}"
+            store_started = time.perf_counter()
+            log_event("inventory_reconciliation_started", cycle_id=cycle_id, workflow_id=workflow_id, store=store_key)
 
             try:
                 # ✅ Real mapping path comes from profile (matches your store_profiles.py)
@@ -148,6 +157,28 @@ def run_forever():
                     if fname and fbytes:
                         attachments.append(maybe_gzip_csv(fname, fbytes))
 
+                log_event(
+                    "inventory_reconciliation_completed",
+                    cycle_id=cycle_id,
+                    workflow_id=workflow_id,
+                    store=store_key,
+                    duration_ms=int((time.perf_counter() - store_started) * 1000),
+                    variants_count=int(summary.get("variants_inspected") or 0) or None,
+                    updates_attempted=(
+                        int(summary.get("updated") or 0)
+                        + int(summary.get("dry") or 0)
+                        + int(summary.get("errors") or 0)
+                    ),
+                    updates_succeeded=int(summary.get("updated") or 0),
+                    updates_failed=int(summary.get("errors") or 0),
+                    metadata={
+                        "dry_run_updates": int(summary.get("dry") or 0),
+                        "translated": int(summary.get("translated") or 0),
+                        "skipped": int(summary.get("skipped") or 0),
+                        "report_name": str(summary.get("report_name") or ""),
+                    },
+                )
+
                 _log_line(
                     f"✅ Done {store_key}: updated={summary.get('updated')} dry={summary.get('dry')} "
                     f"errors={summary.get('errors')} translated={summary.get('translated')} "
@@ -156,6 +187,15 @@ def run_forever():
                 )
 
             except Exception as e:
+                log_event(
+                    "inventory_reconciliation_failed",
+                    status="failure",
+                    cycle_id=cycle_id,
+                    workflow_id=workflow_id,
+                    store=store_key,
+                    duration_ms=int((time.perf_counter() - store_started) * 1000),
+                    error=e,
+                )
                 _log_line(f"❌ Store failed: {store_key} | {type(e).__name__}: {e}")
                 _log_line(traceback.format_exc())
                 continue
@@ -168,6 +208,12 @@ def run_forever():
         else:
             _log_line("📭 No attachments this cycle — email skipped.")
 
+        log_event(
+            "inventory_cycle_completed",
+            cycle_id=cycle_id,
+            duration_ms=int((time.perf_counter() - cycle_started) * 1000),
+            metadata={"attachments_count": len(attachments), "stores_count": len(stores)},
+        )
         _log_line(f"🛌 Cycle {cycle} complete. Sleeping {SLEEP_HOURS} hours…")
         time.sleep(max(1, int(SLEEP_HOURS * 3600)))
 
