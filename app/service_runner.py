@@ -163,6 +163,12 @@ def run_forever():
                     workflow_id=workflow_id,
                     store=store_key,
                     duration_ms=int((time.perf_counter() - store_started) * 1000),
+                    variants_count=int(summary.get("variants_inspected") or 0) or None,
+                    updates_attempted=(
+                        int(summary.get("updated") or 0)
+                        + int(summary.get("dry") or 0)
+                        + int(summary.get("errors") or 0)
+                    ),
                     updates_succeeded=int(summary.get("updated") or 0),
                     updates_failed=int(summary.get("errors") or 0),
                     metadata={
