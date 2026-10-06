@@ -1,13 +1,10 @@
+# core.py
 import os, time, json, re
 from typing import List, Dict, Optional, Callable, Tuple
 from datetime import datetime, timedelta
-import streamlit as st
-from utils.merge_google_sheets_for_stores import run as refresh_csvs
 import pandas as pd
 import requests
-from utils.sheet_config import SHEET_SOURCES
-from utils.gsheets_manager import get_services, get_credentials
-from utils.merge_google_sheets_for_stores import SIZE_WARN_MB, SIZE_ALERT_MB, SIZE_HARD_MB
+from ralawise import get_stock
 
 from constants import (
     API_VERSION, BATCH_SIZE_DEFAULT, SLEEP_BETWEEN_CALLS, RETRY_429_MAX,
@@ -35,69 +32,84 @@ def log(msg: str, cb: Optional[Callable[[str], None]] = None):
         except Exception:
             pass
 
-
 def _fetch_products_variants(
     endpoint: str,
     headers: Dict[str, str],
     product_types: Optional[List[str]],
     progress: Optional[Callable[[str], None]],
     known_variant_ids: Optional[set] = None,
-    days_back: Optional[int] = None
+    days_back: Optional[int] = None,
+    since_iso_utc: Optional[str] = None,
 ) -> List[Dict]:
     """
-    Fetch products + variants, optionally filtered by created_at in the last X days.
-    Stops early if known_variant_ids is provided and a known variant is found.
+    Fetch products + variants.
+
+    ✅ Guaranteed coverage behavior:
+    - If since_iso_utc is provided -> use product updated_at window (NO early stop)
+    - Else if days_back is provided -> use updated_at window (NO early stop)
+    - Else (full scan) -> can early-stop using known_variant_ids if provided
+
+    Why updated_at?
+    - Adding a variant updates the product, even if product was created months ago.
     """
+
+    # Determine window
     cutoff_filter = ""
-    if days_back is not None and days_back > 0:
+    use_window = False
+
+    if since_iso_utc:
+        use_window = True
+        cutoff_filter = f" updated_at:>'{since_iso_utc}'"
+    elif days_back is not None and days_back > 0:
+        use_window = True
         cutoff_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        cutoff_filter = f" created_at:>'{cutoff_date}'"
+        cutoff_filter = f" updated_at:>'{cutoff_date}'"
+
+    # Early stop only allowed when NOT using a window (full scan mode)
+    use_early_stop = (known_variant_ids is not None) and (not use_window)
+
+    # Build query string
+    q = ""
+    if product_types:
+        product_filter = " OR ".join([f"product_type:'{ptype}'" for ptype in product_types])
+        q = f"({product_filter}){cutoff_filter}"
+    else:
+        q = cutoff_filter.strip()
+
+    query_str = """
+    query($after:String, $q:String!) {
+      products(first: 100, query: $q, sortKey: UPDATED_AT, reverse: true, after: $after) {
+        pageInfo { hasNextPage }
+        edges {
+          cursor
+          node {
+            id
+            variants(first: 100) {
+              edges { node { id sku inventoryItem { id } } }
+            }
+          }
+        }
+      }
+    }
+    """
 
     all_rows: List[Dict] = []
     after_cursor = None
     page_count = 0
-    stop_early = False
-
-    if product_types:
-        product_filter = " OR ".join([f"product_type:'{ptype}'" for ptype in product_types])
-        query_str = f"""
-        query($after:String) {{
-          products(first: 100, query: "({product_filter}){cutoff_filter} sort:created_at-desc", after: $after) {{
-            pageInfo {{ hasNextPage }}
-            edges {{
-              cursor
-              node {{
-                id
-                variants(first: 100) {{
-                  edges {{ node {{ id sku inventoryItem {{ id }} }} }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
-    else:
-        query_str = f"""
-        query($after:String) {{
-          products(first: 100, query: "{cutoff_filter.strip()}", sortKey:CREATED_AT, reverse:true, after: $after) {{
-            pageInfo {{ hasNextPage }}
-            edges {{
-              cursor
-              node {{
-                id
-                variants(first: 100) {{
-                  edges {{ node {{ id sku inventoryItem {{ id }} }} }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
 
     while True:
-        data = gql_with_retry(endpoint, headers, query_str, {"after": after_cursor}, progress=progress)
+        data = gql_with_retry(
+            endpoint,
+            headers,
+            query_str,
+            {"after": after_cursor, "q": q},
+            progress=progress
+        )
+
         edges = data["data"]["products"]["edges"]
         page_count += 1
+
+        stop_early = False
 
         for e in edges:
             pid = e["node"]["id"]
@@ -106,9 +118,10 @@ def _fetch_products_variants(
                 inv_item = v.get("inventoryItem")
                 if not inv_item or not inv_item.get("id"):
                     continue
+
                 vid = v["id"]
 
-                if known_variant_ids and vid in known_variant_ids:
+                if use_early_stop and vid in known_variant_ids:
                     stop_early = True
                     if progress:
                         progress(f"🛑 Early stop after {page_count} pages — first known variant {vid} found.")
@@ -138,7 +151,6 @@ def _fetch_products_variants(
     return all_rows
 
 
-
 def build_headers(access_token: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "X-Shopify-Access-Token": access_token}
 
@@ -156,248 +168,326 @@ def translate_sku(messy_sku: str) -> Optional[str]:
         return f"{base}{colour}{size}"
     return None
 
-# --------------------------- Latest Helpers ---------------------------
-import glob
+# --- state tracking (per-store) ---
 
-def _store_from_map_csv(map_csv_path: str) -> Optional[str]:
-    """
-    utils/shopify_inventory_map_spoofy.csv -> spoofy
-    """
-    m = re.search(r"shopify_inventory_map_([a-z0-9_-]+)\.csv$", map_csv_path, re.I)
-    return m.group(1) if m else None
+def _safe_store_key(store_key: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "_", str(store_key).strip().lower()) or "store"
 
-def _latest_split_csv_for_store(store: str, base_dir: Optional[str] = None) -> Optional[str]:
-    """
-    Find utils/shopify_inventory_map_<store>_<N>.csv with the highest N.
-    If none exist, return path for _1 (so we can create it).
-    """
-    base = base_dir or os.path.dirname(os.path.abspath(__file__))
-    # Usually your files are under utils/, so anchor there if present
-    utils_dir = os.path.join(base, "utils")
-    search_dir = utils_dir if os.path.isdir(utils_dir) else base
 
-    pattern = os.path.join(search_dir, f"shopify_inventory_map_{store}_*.csv")
-    candidates = []
-    for p in glob.glob(pattern):
-        m = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(p), re.I)
-        if m:
-            candidates.append((int(m.group(1)), p))
-
-    if not candidates:
-        # default to _1 in the utils/ folder (or base if utils missing)
-        return os.path.join(search_dir, f"shopify_inventory_map_{store}_1.csv")
-
-    candidates.sort(key=lambda t: t[0])
-    return candidates[-1][1]
-
-# ===== Rotation + Registry helpers =====
-def _sheet_sources_json_path() -> str:
+def _state_dir_for_map(map_csv_path: str) -> str:
     """
-    Locate utils/sheet_config.py then resolve sheet_sources.json next to it.
-    This matches your new JSON-based registry.
+    State lives next to the mapping CSV so each store/project is self-contained.
+    Example:
+      utils/shopify_inventory_map_spoofy.csv
+      utils/_state/spoofy_last_run.json
+      utils/_state/spoofy_mapping_cursor.json
     """
-    import utils.sheet_config as sc
-    cfg_dir = os.path.dirname(sc.__file__)
-    return os.path.join(cfg_dir, "sheet_sources.json")
+    base = os.path.dirname(map_csv_path) or "."
+    d = os.path.join(base, "_state")
+    os.makedirs(d, exist_ok=True)
+    return d
 
-def _persist_new_sheet_id(store: str, new_sheet_id: str):
-    """
-    Append the new sheet ID to sheet_sources.json and update in-memory SHEET_SOURCES.
-    """
-    json_path = _sheet_sources_json_path()
+
+def _last_run_state_path(map_csv_path: str, store_key: str) -> str:
+    safe = _safe_store_key(store_key)
+    return os.path.join(_state_dir_for_map(map_csv_path), f"{safe}_last_run.json")
+
+
+def load_last_run_utc(map_csv_path: str, store_key: str) -> Optional[str]:
+    p = _last_run_state_path(map_csv_path, store_key)
+    if not os.path.exists(p):
+        return None
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        data = {}
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f) or {}
+        v = obj.get("last_run_utc")
+        return v if isinstance(v, str) and v.strip() else None
+    except Exception:
+        return None
 
-    data.setdefault(store, [])
-    if new_sheet_id not in data[store]:
-        data[store].append(new_sheet_id)
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+def save_last_run_utc(map_csv_path: str, store_key: str, iso_utc: Optional[str] = None) -> None:
+    if iso_utc is None:
+        iso_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # keep in-memory constant in sync for this process
-    if store not in SHEET_SOURCES:
-        SHEET_SOURCES[store] = []
-    if new_sheet_id not in SHEET_SOURCES[store]:
-        SHEET_SOURCES[store].append(new_sheet_id)
+    p = _last_run_state_path(map_csv_path, store_key)
+    payload = {"last_run_utc": iso_utc}
 
-def _current_version_for_store(store: str) -> int:
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def _cursor_state_path(map_csv_path: str, store_key: str) -> str:
+    safe = _safe_store_key(store_key)
+    return os.path.join(_state_dir_for_map(map_csv_path), f"{safe}_mapping_cursor.json")
+
+
+def load_cursor(map_csv_path: str, store_key: str) -> Optional[str]:
+    p = _cursor_state_path(map_csv_path, store_key)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f) or {}
+        return obj.get("after_cursor")
+    except Exception:
+        return None
+
+
+def save_cursor(map_csv_path: str, store_key: str, after_cursor: Optional[str]) -> None:
+    p = _cursor_state_path(map_csv_path, store_key)
+    obj = {"after_cursor": after_cursor, "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+# --------------------------- helper 
+def audit_mapping_coverage(
+    endpoint: str,
+    headers: Dict[str, str],
+    map_csv_path: str,
+    product_types: Optional[List[str]] = None,
+    pages: int = 5,
+    after: Optional[str] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Dict[str, int]:
     """
-    Version is 1-based. Current/last version = len(SHEET_SOURCES[store]).
-    If none exist, treat as version 0 for math (next will be 1).
+    Verifies whether the local mapping CSV contains all variant_ids seen in Shopify
+    for the scanned pages. Scans WITHOUT days_back cutoff.
     """
-    return len(SHEET_SOURCES.get(store, []))
+    if not os.path.exists(map_csv_path):
+        raise FileNotFoundError(f"Mapping CSV not found: {map_csv_path}")
 
-def _tab_title(store: str, version: int, with_csv_suffix: bool = True) -> str:
-    base = f"shopify_inventory_map_{store}_{version}"
-    return f"{base}.csv" if with_csv_suffix else base
+    df = _safe_read_csv(map_csv_path, dtype=str)
+    if df.empty or "variant_id" not in df.columns:
+        raise RuntimeError("Mapping CSV empty or missing variant_id column.")
 
-def _resolve_or_create_tab_title(sheets, spreadsheet_id: str, desired_base_title: str, columns_count: int = 4) -> str:
-    """
-    Return matching tab (either 'base' or 'base.csv'). If none, create 'base.csv'.
-    """
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    titles = [s['properties']['title'] for s in meta.get('sheets', [])]
+    known = set(df["variant_id"].astype(str))
+    scanned_variants = 0
+    missing_variants = 0
 
-    if desired_base_title in titles:
-        return desired_base_title
-
-    csv_title = f"{desired_base_title}.csv"
-    if csv_title in titles:
-        return csv_title
-
-    sheets.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"requests": [{"addSheet": {"properties": {
-            "title": csv_title,
-            "gridProperties": {"rowCount": 1000, "columnCount": columns_count}
-        }}}]}
-    ).execute()
-    return csv_title
-
-def _create_new_spreadsheet_with_tab(sheets, store: str, version: int) -> tuple[str, str]:
-    """
-    Create spreadsheet named 'shopify_inventory_map_<store>_<version>'
-    and ensure a tab 'shopify_inventory_map_<store>_<version>.csv' exists.
-    Returns (spreadsheet_id, tab_title).
-    """
-    title = f"shopify_inventory_map_{store}_{version}"
-    new_ss = sheets.spreadsheets().create(body={"properties": {"title": title}}).execute()
-    ss_id = new_ss.get("spreadsheetId")
-    tab_title = _resolve_or_create_tab_title(sheets, ss_id, desired_base_title=title, columns_count=4)
-    return ss_id, tab_title
-
-def _rotate_google_targets_if_needed(
-    store: str,
-    current_split_csv_path: str,
-    size_threshold_mb: float = 90.0,
-) -> tuple[str, str]:
-    """
-    Decide which Google Sheet FILE (and tab) to append to.
-
-    If the *local* split CSV size is below threshold:
-      → keep appending to the latest registered spreadsheet (vN) and ensure its tab exists.
-
-    If the *local* split CSV size is >= threshold:
-      → create a brand-new Google Sheets FILE (vN+1),
-         ensure its tab exists, persist its ID to sheet_sources.json,
-         and return that new (sheet_id, tab_title) so new rows go there.
-    """
-    size_mb = _file_size_mb(current_split_csv_path)
-    if store not in SHEET_SOURCES or len(SHEET_SOURCES[store]) == 0:
-        raise RuntimeError(f"No spreadsheet IDs registered for store '{store}'")
-
-    current_version = _current_version_for_store(store)  # vN
-    latest_sheet_id = SHEET_SOURCES[store][-1]
-    _, sheets = get_services()
-
-    # Keep writing to current latest file
-    if size_mb < size_threshold_mb:
-        desired_base_title = _tab_title(store, current_version, with_csv_suffix=False)
-        target_tab = _resolve_or_create_tab_title(
-            sheets=sheets,
-            spreadsheet_id=latest_sheet_id,
-            desired_base_title=desired_base_title,
-            columns_count=4
-        )
-        print(f"[rotate] No rotation (size={size_mb:.2f} MB). Using file v{current_version}, tab: {target_tab}")
-        return latest_sheet_id, target_tab
-
-    # ROTATE → brand-new FILE
-    next_version = current_version + 1
-    print(f"[rotate] Threshold hit (size={size_mb:.2f} MB ≥ {size_threshold_mb} MB). Creating new file v{next_version}…")
-
-    new_sheet_id, new_tab_title = _create_new_spreadsheet_with_tab(sheets, store, next_version)
-    _persist_new_sheet_id(store, new_sheet_id)
-    print(f"[rotate] New spreadsheet created and persisted: v{next_version} id={new_sheet_id}, tab={new_tab_title}")
-
-    # From now on, append to the new file
-    return new_sheet_id, new_tab_title
-
-
-def _append_rows_csv_and_gsheet(
-    new_rows: list[dict],
-    store: str,
-    sheet_ids: dict,
-    sheet_json_path: str,
-    store_split_prefix: str,
-    google_client: gspread.Client,
-    progress: Callable[[str], None],
-    hard_size_threshold_mb: float,
-) -> None:
-    """Appends new rows to latest split file and sheet, and creates new one if too big."""
-    from utils.utils_io import save_csv_append, get_csv_size_mb, create_new_gsheet_tab
-
-    # Step 1: Determine current latest CSV
-    current_index = 1
-    while os.path.exists(f"{store_split_prefix}_{current_index}.csv"):
-        current_index += 1
-    latest_csv = f"{store_split_prefix}_{current_index - 1}.csv"
-    latest_size = get_csv_size_mb(latest_csv)
-    progress(f"[INFO] Latest CSV for store '{store}' is {latest_csv} ({latest_size:.2f} MB)")
-
-    # Step 2: Check if we need a new file
-    if latest_size >= hard_size_threshold_mb:
-        progress(f"[HARD] {latest_csv} is {latest_size:.2f} MB → ⛔ Creating a new Google Sheet tab")
-        current_index += 1
-        new_csv = f"{store_split_prefix}_{current_index}.csv"
-        save_csv_append(new_csv, new_rows)
-        progress(f"✅ Created new CSV: {new_csv}")
-
-        # Create new sheet tab
-        if store in sheet_ids:
-            parent_sheet_id = sheet_ids[store]["parent_sheet_id"]
-            new_tab_title = os.path.basename(new_csv)
-            sheet = google_client.open_by_key(parent_sheet_id)
-            sheet.add_worksheet(title=new_tab_title, rows="1000", cols="30")
-            sheet_ids[store][f"sheet_{current_index}"] = new_tab_title
-            progress(f"✅ Created new tab '{new_tab_title}' in Google Sheet")
-
-            # Save updated JSON map
-            with open(sheet_json_path, "w", encoding="utf-8") as f:
-                json.dump(sheet_ids, f, indent=2)
-            progress("✅ Updated shopify_sheet_ids.json with new sheet tab")
-
-            # Now append rows
-            ws = sheet.worksheet(new_tab_title)
-            ws.append_rows([list(row.values()) for row in new_rows])
-            progress(f"✅ Appended {len(new_rows)} row(s) to new tab '{new_tab_title}'")
-        else:
-            progress(f"[ERROR] No sheet ID found for store: {store}")
+    # Build query (no cutoff)
+    if product_types:
+        product_filter = " OR ".join([f"product_type:'{ptype}'" for ptype in product_types])
+        query_str = f"""
+        query($after:String) {{
+          products(first: 100, query: "({product_filter}) sort:created_at-desc", after: $after) {{
+            pageInfo {{ hasNextPage }}
+            edges {{
+              cursor
+              node {{
+                id
+                variants(first: 100) {{
+                  edges {{ node {{ id sku inventoryItem {{ id }} }} }}
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
     else:
-        # No overflow, just append to existing CSV and sheet
-        save_csv_append(latest_csv, new_rows)
-        progress(f"✅ Appended {len(new_rows)} row(s) to existing CSV: {latest_csv}")
+        query_str = """
+        query($after:String) {
+          products(first: 100, sortKey:CREATED_AT, reverse:true, after: $after) {
+            pageInfo { hasNextPage }
+            edges {
+              cursor
+              node {
+                id
+                variants(first: 100) {
+                  edges { node { id sku inventoryItem { id } } }
+                }
+              }
+            }
+          }
+        }
+        """
 
-        # Append to existing Google Sheet tab
-        if store in sheet_ids:
-            latest_tab = os.path.basename(latest_csv)
-            sheet = google_client.open_by_key(sheet_ids[store]["parent_sheet_id"])
-            ws = sheet.worksheet(latest_tab)
-            ws.append_rows([list(row.values()) for row in new_rows])
-            progress(f"✅ Appended {len(new_rows)} row(s) to Google Sheet tab '{latest_tab}'")
-        else:
-            progress(f"[ERROR] No sheet ID found for store: {store}")
+    cur = after
+    for p in range(1, pages + 1):
+        data = gql_with_retry(endpoint, headers, query_str, {"after": cur}, progress=progress)
+        edges = data["data"]["products"]["edges"]
+        if not edges:
+            break
+
+        for e in edges:
+            for ve in e["node"]["variants"]["edges"]:
+                v = ve["node"]
+                inv_item = v.get("inventoryItem")
+                if not inv_item or not inv_item.get("id"):
+                    continue
+                vid = str(v["id"])
+                scanned_variants += 1
+                if vid not in known:
+                    missing_variants += 1
+
+        cur = edges[-1]["cursor"]
+        if progress:
+            progress(f"🔍 Audit page {p}/{pages}: scanned_variants={scanned_variants}, missing={missing_variants}")
+
+        if not data["data"]["products"]["pageInfo"]["hasNextPage"]:
+            break
+
+    return {
+        "scanned_variants": scanned_variants,
+        "missing_variants": missing_variants,
+        "mapping_rows": len(df),
+    }
 
 
-def _file_size_mb(path: str) -> float:
+def backfill_missing_variants(
+    endpoint: str,
+    headers: Dict[str, str],
+    map_csv_path: str,
+    store_key: str,
+    product_types: Optional[List[str]],
+    pages: int = 3,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[int, Optional[str]]:
+    """
+    Scan N pages WITHOUT days_back and append only missing variant_ids.
+    Returns (added_count, next_cursor).
+    """
+    cols = ["product_id", "variant_id", "sku", "inventory_item_id"]
+
+    existing = _safe_read_csv(map_csv_path, dtype=str)
+    known_ids = set(existing["variant_id"].astype(str)) if (not existing.empty and "variant_id" in existing.columns) else set()
+
+    after_cursor = load_cursor(map_csv_path, store_key)
+    added_rows = []
+
+    # Query (no cutoff)
+    if product_types:
+        product_filter = " OR ".join([f"product_type:'{ptype}'" for ptype in product_types])
+        q = f"({product_filter})"
+    else:
+        q = ""
+
+    query_str = """
+    query($after:String, $q:String!) {
+      products(first: 100, query: $q, sortKey: CREATED_AT, reverse: true, after: $after) {
+        pageInfo { hasNextPage }
+        edges {
+          cursor
+          node {
+            id
+            variants(first: 100) {
+              edges { node { id sku inventoryItem { id } } }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    next_cursor = after_cursor
+    for p in range(1, pages + 1):
+        data = gql_with_retry(endpoint, headers, query_str, {"after": next_cursor, "q": q}, progress=progress)
+        edges = data["data"]["products"]["edges"]
+        if not edges:
+            next_cursor = None
+            break
+
+        page_added = 0
+        for e in edges:
+            pid = e["node"]["id"]
+            for ve in e["node"]["variants"]["edges"]:
+                v = ve["node"]
+                inv_item = v.get("inventoryItem")
+                if not inv_item or not inv_item.get("id"):
+                    continue
+
+                vid = str(v["id"])
+                if vid in known_ids:
+                    continue
+
+                known_ids.add(vid)
+                added_rows.append({
+                    "product_id": pid,
+                    "variant_id": vid,
+                    "sku": v.get("sku"),
+                    "inventory_item_id": inv_item["id"]
+                })
+                page_added += 1
+
+        next_cursor = edges[-1]["cursor"]
+
+        if progress:
+            progress(f"🩹 Backfill page {p}/{pages}: added={page_added}, total_added={len(added_rows)}")
+
+        if not data["data"]["products"]["pageInfo"]["hasNextPage"]:
+            next_cursor = None
+            break
+
+    # advance cursor even if no adds (so we keep sweeping the catalog)
+    save_cursor(map_csv_path, store_key, next_cursor)
+
+    if not added_rows:
+        return 0, next_cursor
+
+    new_df = pd.DataFrame(added_rows, columns=cols)
+    combined = pd.concat([existing, new_df], ignore_index=True).drop_duplicates(subset=["variant_id"], keep="last")
+    _atomic_write_csv(combined, map_csv_path)
+
+    return len(new_df), next_cursor
+
+def _parse_iso_utc(s: str) -> Optional[datetime]:
+    """
+    Accepts 'YYYY-MM-DDTHH:MM:SSZ' or ISO strings with/without trailing Z.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
     try:
-        return os.path.getsize(path) / (1024 * 1024)
-    except OSError:
-        return 0.0
-    
-def log_file_size_alert(path: str, label: str, progress: Optional[Callable[[str], None]]):
-    sz = _file_size_mb(path) #SIZE_WARN_MB, SIZE_ALERT_MB, SIZE_HARD_MB
-    if sz >= SIZE_HARD_MB:
-        log(f"[HARD] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
-    elif sz >= SIZE_ALERT_MB:
-        log(f"[ALERT] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
-    elif sz >= SIZE_WARN_MB:
-        log(f"[WARN] {label} {os.path.basename(path)} = {sz:.2f} MB", progress)
+        if t.endswith("Z"):
+            return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
+        # fallback for '2026-01-22T12:34:56' (no Z)
+        return datetime.fromisoformat(t.replace("Z", ""))
+    except Exception:
+        return None
 
+def _iso_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def build_unmatched_sku_report(inv_map_df: pd.DataFrame, stock_map: dict) -> pd.DataFrame:
+    """
+    inv_map_df must contain: sku, product_id, variant_id, inventory_item_id (and optionally lookup_sku)
+    stock_map keys must be normalized SKUs (uppercase/stripped).
+    Returns rows that cannot be resolved to stock.
+    """
+    df = inv_map_df.copy()
+
+    # Normalize sku
+    df["sku_norm"] = df["sku"].astype(str).str.strip().str.upper()
+
+    # If lookup_sku exists, normalize it too, else use sku_norm
+    if "lookup_sku" in df.columns:
+        df["lookup_norm"] = df["lookup_sku"].astype(str).str.strip().str.upper()
+    else:
+        df["lookup_norm"] = df["sku_norm"]
+
+    stock_keys = set(str(k).strip().upper() for k in stock_map.keys())
+
+    # Unmatched = lookup_norm not in stock_keys
+    unmatched = df[~df["lookup_norm"].isin(stock_keys)].copy()
+    unmatched["reason"] = "SKU not found in stock feed"
+
+
+    # Keep only useful columns
+    keep = [c for c in ["reason", "sku", "sku_norm", "lookup_sku", "lookup_norm", "product_id", "variant_id", "inventory_item_id"] if c in unmatched.columns]
+
+    unmatched = unmatched[keep].drop_duplicates()
+
+    return unmatched
 
 # ---- Throttling helpers ----
 def _throttle_wait_from_cost(data, default_wait=2.0):
@@ -484,164 +574,163 @@ def get_product_ids_for_types(endpoint: str, headers: Dict[str, str], product_ty
                 break
     return found
 
-
-def ensure_mapping(endpoint: str, headers: Dict[str, str], map_csv_path: str,
-                   product_types: Optional[List[str]],
-                   progress: Optional[Callable[[str], None]] = None,
-                   days_back: Optional[int] = None) -> Tuple[int, int]:
-    """
-    Ensure mapping CSV exists; if missing, build full (no date filter).
-    If exists, append only NEW variants (by variant_id) using early stop and optional days_back filter.
-
-    NEW: also append the same new rows to the latest split CSV file for this store:
-         utils/shopify_inventory_map_<store>_<N>.csv
-         and warn if that file passes 90/95/100 MB.
-    """
-    cols = ["product_id", "variant_id", "sku", "inventory_item_id"]
-
-    folder = os.path.dirname(map_csv_path)
+def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
+    folder = os.path.dirname(path)
     if folder:
         os.makedirs(folder, exist_ok=True)
 
-    store = _store_from_map_csv(map_csv_path)
-    latest_split_csv = _latest_split_csv_for_store(store) if store else None
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        df.to_csv(f, index=False)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp, path)
+
+
+def _safe_read_csv(path: str, *, dtype=str, retries: int = 3, sleep_s: float = 0.5) -> pd.DataFrame:
+    """
+    Robust CSV read for long-running services.
+    If file is temporarily locked/half-written, retry a few times.
+    """
+    last_err = None
+    for _ in range(retries):
+        try:
+            return pd.read_csv(path, dtype=dtype)
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_s)
+
+    # Last attempt: try reading with python engine (more forgiving)
+    try:
+        return pd.read_csv(path, dtype=dtype, engine="python", on_bad_lines="skip")
+    except Exception:
+        raise RuntimeError(f"Failed to read CSV '{path}': {last_err}")
+    
+def ensure_mapping_local(
+    endpoint: str,
+    headers: Dict[str, str],
+    map_csv_path: str,
+    product_types: Optional[List[str]],
+    progress: Optional[Callable[[str], None]] = None,
+    days_back: Optional[int] = 7,
+    store_key: Optional[str] = None,
+    full_build: bool = False,
+    backfill_pages_per_run: int = 0,
+    safety_overlap_days: int = 1,   # ✅ add this
+) -> Tuple[int, int]:
+
+
+    sk = (store_key or "").strip().lower() or "store"
+    cols = ["product_id", "variant_id", "sku", "inventory_item_id"]
+    os.makedirs(os.path.dirname(map_csv_path) or ".", exist_ok=True)
 
     # ---------- Full build ----------
-    if not os.path.exists(map_csv_path):
-        log(f"🆕 Mapping not found. Building full mapping → {map_csv_path}", progress)
+    if full_build or (not os.path.exists(map_csv_path)):
+        log(f"🆕 Building mapping (full) → {map_csv_path}", progress)
+
         rows = _fetch_products_variants(
-            endpoint, headers, product_types, progress,
-            known_variant_ids=None, days_back=None
+            endpoint, headers,
+            product_types=None if sk == "fullyblessed" else product_types,
+            progress=progress,
+            known_variant_ids=None,
+            days_back=None,
+            since_iso_utc=None,
         )
-        pd.DataFrame(rows, columns=cols).to_csv(map_csv_path, index=False)
 
-        if latest_split_csv != map_csv_path:
-            csv_path, gsheet_id = get_latest_split_csv_and_gsheet_for_store(store)
-            validate_sheet_matches_csv(csv_path= csv_path, sheet_id= gsheet_id)
-            log(f"📤 Appending {len(rows)} new rows to Google Sheet ID: {gsheet_id}", progress)
+        df = pd.DataFrame(rows, columns=cols).drop_duplicates(subset=["variant_id"], keep="last")
+        _atomic_write_csv(df, map_csv_path)
 
-            used_path = _append_rows_csv_and_gsheet(
-                rows=rows,  # ✅ FIXED
-                columns=cols,
-                csv_path=csv_path,
-                store=store,
-                google_sheet_id=gsheet_id,
-                progress=progress,
-            )
-            log_file_size_alert(used_path, "split file", progress)
+        # mark successful
+        save_last_run_utc(map_csv_path, sk)
 
-        log(f"✅ Mapping created with {len(rows)} variants.", progress)
-        return len(rows), len(rows)
+        log(f"✅ Mapping saved with {len(df)} variants.", progress)
+        return len(df), len(df)
 
+    # ---------- Incremental ----------
+    existing = _safe_read_csv(map_csv_path, dtype=str)
+    known_ids = set(existing["variant_id"].astype(str)) if (not existing.empty and "variant_id" in existing.columns) else set()
 
-    # ---------- Incremental append ----------
-    existing = pd.read_csv(map_csv_path, dtype=str)
-    known_ids = set(existing["variant_id"].astype(str)) if not existing.empty else set()
     log(f"🔎 Checking for new variants (current count: {len(known_ids)})…", progress)
 
-    new_rows = _fetch_products_variants(
-        endpoint, headers, product_types, progress,
-        known_variant_ids=known_ids, days_back=days_back
+    since_raw = load_last_run_utc(map_csv_path, sk or "store")
+
+    since_iso = None
+    if since_raw:
+        dt = _parse_iso_utc(since_raw)
+        if dt:
+            dt2 = dt - timedelta(days=max(int(safety_overlap_days), 0))
+            since_iso = _iso_utc(dt2)
+
+    rows = _fetch_products_variants(
+        endpoint, headers,
+        product_types=None if sk == "fullyblessed" else product_types,
+        progress=progress,
+        known_variant_ids=None,                 # no early-stop in incremental
+        days_back=None if since_iso else days_back,
+        since_iso_utc=since_iso,
     )
 
-    if new_rows:
-        # Append to merged map first
-        last_sheet_id = SHEET_SOURCES[store][-1] if store in SHEET_SOURCES else None
-        _append_rows_csv_and_gsheet(
-            rows=new_rows,
-            columns=cols,
-            csv_path=latest_split_csv,
-            store=store,
-            google_sheet_id=last_sheet_id,
-            sheet_tab_name=get_sheet_tab_name_from_latest_split_csv(store),
+    added_count = 0
+
+    if rows:
+        fetched = pd.DataFrame(rows, columns=cols).drop_duplicates(subset=["variant_id"], keep="last")
+        new_df = fetched[~fetched["variant_id"].astype(str).isin(known_ids)].copy()
+
+        if not new_df.empty:
+            combined = pd.concat([existing, new_df], ignore_index=True).drop_duplicates(subset=["variant_id"], keep="last")
+            _atomic_write_csv(combined, map_csv_path)
+            existing = combined
+            added_count += len(new_df)
+            log(f"➕ Added {len(new_df)} new variants (window). Total now {len(existing)}.", progress)
+        else:
+            log("✅ No new variants found (window).", progress)
+    else:
+        log("✅ No variants fetched in window.", progress)
+
+    # mark successful window refresh
+    save_last_run_utc(map_csv_path, sk)
+
+    # ---------- Self-heal gaps (cursor sweep) ----------
+    if backfill_pages_per_run and backfill_pages_per_run > 0:
+        healed, _ = backfill_missing_variants(
+            endpoint=endpoint,
+            headers=headers,
+            map_csv_path=map_csv_path,
+            store_key=sk,
+            product_types=None if sk == "fullyblessed" else product_types,
+            pages=int(backfill_pages_per_run),
             progress=progress,
         )
+        if healed:
+            added_count += healed
+            existing = _safe_read_csv(map_csv_path, dtype=str)
+            log(f"🩹 Backfill healed +{healed} missing variants. Total now {len(existing)}.", progress)
 
-        log(f"➕ Added {len(new_rows)} new variants to mapping.", progress)
-
-        # Check if any mismatch with registered sheet/CSV (defensive)
-        csv_path, gsheet_id = get_latest_split_csv_and_gsheet_for_store(store)
-        validate_sheet_matches_csv(csv_path=csv_path, sheet_id=gsheet_id)
-        if csv_path != latest_split_csv or gsheet_id != last_sheet_id:
-            _append_rows_csv_and_gsheet(
-                rows=new_rows,
-                columns=cols,
-                csv_path=csv_path,
-                store=store,
-                google_sheet_id=gsheet_id,
-                progress=progress,
-            )
-
-        # Always check the latest actual file size (even if append skipped)
-        log_file_size_alert(latest_split_csv, "split file", progress)
-
-
-    else:
-        log("✅ No new variants found.", progress)
-
-    total_after = len(known_ids) + len(new_rows)
-    return total_after, len(new_rows)
+    return (len(existing), added_count)
 
 
 # ---------------------------   
 # Other helpers
 # ---------------------------
-
-def get_sheet_tab_name_from_latest_split_csv(store: str, base_dir: Optional[str] = None) -> Optional[str]:
-    import glob
-    base = base_dir or os.path.dirname(os.path.abspath(__file__))
-    utils_dir = os.path.join(base, "utils")
-    search_dir = utils_dir if os.path.isdir(utils_dir) else base
-
-    pattern = os.path.join(search_dir, f"shopify_inventory_map_{store}_*.csv")
-    candidates = []
-    for p in glob.glob(pattern):
-        m = re.search(rf"shopify_inventory_map_{store}_(\d+)\.csv$", os.path.basename(p), re.I)
-        if m:
-            candidates.append((int(m.group(1)), p))
-
-    if not candidates:
-        raise ValueError(f"No split CSVs found for store '{store}' to infer tab name.")
-
-    candidates.sort(key=lambda t: t[0])
-    latest_version = candidates[-1][0]
-    return f"shopify_inventory_map_{store}_{latest_version}"
-
-
-def validate_sheet_matches_csv(csv_path: str, sheet_id: str):
-    # Just a sanity check to help during dev
-    basename = os.path.basename(csv_path)
-    match = re.match(r"shopify_inventory_map_([a-z0-9]+)_(\d+)\.csv", basename)
-    if not match:
-        return
-    store, version = match.group(1), int(match.group(2))
-    expected_id = SHEET_SOURCES[store][version - 1]
-    if expected_id != sheet_id:
-        print(f"[WARN] GSheet mismatch: expected {expected_id}, got {sheet_id}")
-
-
-def get_latest_split_csv_and_gsheet_for_store(store: str) -> tuple[str, Optional[str]]:
-    """
-    Returns:
-      - path to latest local split CSV for the store
-      - Google Sheet ID of last sheet for this store, or None if not found
-    """
-    latest_csv = _latest_split_csv_for_store(store)
-    last_sheet_id = SHEET_SOURCES[store][-1] if store in SHEET_SOURCES else None
-    return latest_csv, last_sheet_id
-
 def load_shared_stock_csv(path: str) -> Dict[str, int]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Stock CSV not found: {path}")
-    df = pd.read_csv(path, dtype=str)
+
+    df = _safe_read_csv(path, dtype=str)
+
     cols = {c.lower(): c for c in df.columns}
     if "sku" not in cols or "free" not in cols:
         raise ValueError(f"CSV must contain 'SKU' and 'free' columns. Found: {list(df.columns)}")
+
     sku_col, free_col = cols["sku"], cols["free"]
-    df = df[[sku_col, free_col]].copy()
-    df[sku_col] = df[sku_col].astype(str).str.strip()
-    df[free_col] = pd.to_numeric(df[free_col], errors="coerce").fillna(0).astype(int)
-    return dict(zip(df[sku_col], df[free_col]))
+    tmp = df[[sku_col, free_col]].copy()
+    tmp[sku_col] = tmp[sku_col].astype(str).str.strip()
+    tmp[free_col] = pd.to_numeric(tmp[free_col], errors="coerce").fillna(0).astype(int)
+
+    # keep last per SKU (same as DF logic)
+    return tmp.groupby(sku_col)[free_col].last().to_dict()
+
 
 
 def set_on_hand_quantities(endpoint: str, headers: Dict[str, str], batch_rows,
@@ -700,111 +789,242 @@ def set_on_hand_quantities(endpoint: str, headers: Dict[str, str], batch_rows,
 # ---------------------------
 # Main workflow
 # ---------------------------
-
-def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional[List[str]],
-               location_name: Optional[str], batch_size: int, map_csv: Optional[str],
-               stock_csv_path: Optional[str], dry_run: bool, build_map: bool,
-               store_profiles: Dict[str, Dict],
+# core.py — full run_update()
+def run_update(*,
+               store: str,
+               sku_prefixes: list[str] | None = None,
+               product_types: Optional[List[str]] = None,
+               location_name: Optional[str] = None,
+               batch_size: int = BATCH_SIZE_DEFAULT,
+               map_csv: Optional[str] = None,
+               stock_csv_path: Optional[str] = None,   # kept for compatibility, but not used by default
+               dry_run: bool = True,
+               build_map: bool = False,
+               stock_csv_df=None,
+               store_profiles: Dict[str, Dict] = None,
                progress: Optional[Callable[[str], None]] = None,
                days_back: int = 7,
-               force_refresh_google_sheets: bool = False) -> Tuple[pd.DataFrame, Dict]:
+               force_refresh_google_sheets: bool = False  # ignored in service-only
+               ) -> Tuple[pd.DataFrame, Dict]:
 
+    # --- store/profile resolution (service-safe) ---
+    if store_profiles is None:
+        raise RuntimeError("store_profiles is required")
+
+    store_in = str(store).strip()
+    if store_in in store_profiles:
+        store_key = store_in
+    else:
+        lookup = {k.lower(): k for k in store_profiles.keys()}
+        if store_in.lower() in lookup:
+            store_key = lookup[store_in.lower()]
+        else:
+            raise KeyError(f"Unknown store '{store}'. Known: {list(store_profiles.keys())}")
+
+    profile = store_profiles[store_key]
     start_ts = time.time()
-    profile = store_profiles[store]
+
     shop_url = profile["SHOP_URL"]
     access_token = profile["ACCESS_TOKEN"]
     map_csv = map_csv or profile["MAP_CSV"]
-    stock_csv_path = stock_csv_path or STOCK_CSV_PATH
-    sku_prefix = profile["DEFAULT_SKU_PREFIX"] if sku_prefix is None else sku_prefix
-    product_types = product_types if product_types is not None else profile["DEFAULT_PRODUCT_TYPES"]
+
+    if not sku_prefixes:
+        sku_prefixes = profile.get("DEFAULT_SKU_PREFIXES") or None
+    product_types = product_types if product_types is not None else profile.get("DEFAULT_PRODUCT_TYPES") or None
     location_name = location_name if location_name is not None else profile.get("LOCATION_NAME")
 
     graphql_endpoint = f"https://{shop_url}/admin/api/{API_VERSION}/graphql.json"
     headers = build_headers(access_token)
 
-    try:
-        shop_info = preflight(graphql_endpoint, headers)
-        log(f"✅ Connected to {shop_info.get('name')} ({shop_info.get('myshopifyDomain')})", progress)
-    except Exception as e:
-        msg = str(e)
-        if "Invalid API key or access token" in msg or "invalid_token" in msg or "invalid" in msg.lower():
+    shop_info = preflight(graphql_endpoint, headers, progress=progress)
+    log(f"✅ Connected to {shop_info.get('name')} ({shop_info.get('myshopifyDomain')})", progress)
+
+    # --- Safety: prevent accidental full-build on huge stores ---
+    if (not os.path.exists(map_csv)) and (not build_map):
+        # Only allow "missing map => full build" for fullyblessed (small)
+        if str(store_key).strip().lower() != "fullyblessed":
             raise RuntimeError(
-                "Shopify rejected the credentials.\n"
-                "• Check Admin API token (Develop apps → Your app → Admin API access token)\n"
-                "• Ensure scopes include read_products and write_inventory\n"
-                "• Confirm SHOP_URL is correct\n"
-                "• Remove spaces/newlines from the token"
+                f"Mapping CSV missing for {store_key}: {map_csv}\n"
+                "Refusing to full-build for large stores. Copy your existing mapping CSV into that path first."
             )
-        raise
 
-    # 🔄 Refresh Google Sheet data (export + merge)
-    refresh_csvs(
-        force_refresh=force_refresh_google_sheets,
-        progress=progress,
-        stores=[store]  # 👈 only the current store
-    )
-
-
-
+    # Build/refresh mapping (local only)
     if build_map or not os.path.exists(map_csv):
-        total_after, added = ensure_mapping(graphql_endpoint, headers, map_csv, product_types, progress, days_back=days_back)
+        total_after, added = ensure_mapping_local(
+            graphql_endpoint, headers, map_csv,
+            product_types=product_types,
+            progress=progress,
+            days_back=days_back,
+            store_key=store_key,
+            full_build=True
+        )
         if build_map:
             elapsed = round(time.time() - start_ts, 2)
             return pd.DataFrame(), {
                 "message": f"Mapping built/updated. Total variants: {total_after}, added: {added}",
                 "updated": 0, "dry": 0, "errors": 0, "translated": 0,
-                "skipped": 0, "report_filename": "", "elapsed_secs": elapsed
+                "skipped": 0, "report_name": "", "report_csv_bytes": b"",
+                "unmatched_report_name": "", "unmatched_report_csv_bytes": b"",
+                "unmatched_count": 0,
+                "elapsed_secs": elapsed
             }
 
-    total_after, added = ensure_mapping(graphql_endpoint, headers, map_csv, product_types, progress, days_back=days_back)
+    # Decide backfill pages dynamically (works for new stores automatically)
+    try:
+        existing_rows = len(_safe_read_csv(map_csv, dtype=str))
+    except Exception:
+        existing_rows = 0
+
+    def _auto_backfill_pages(n_rows: int) -> int:
+        if n_rows <= 0:
+            return 1
+        if n_rows < 200_000:
+            return 10
+        if n_rows < 800_000:
+            return 5
+        return 2  # huge stores
+
+    backfill_pages = profile.get("BACKFILL_PAGES_PER_RUN")
+    if not backfill_pages:
+        backfill_pages = _auto_backfill_pages(existing_rows)
+
+    total_after, added = ensure_mapping_local(
+        graphql_endpoint, headers, map_csv,
+        product_types=product_types,
+        progress=progress,
+        days_back=days_back,
+        store_key=store_key,
+        full_build=False,
+        backfill_pages_per_run=int(backfill_pages),
+    )
+
     if added:
         log(f"🔁 Mapping refreshed: +{added} new variants (total {total_after}).", progress)
 
-    stock_map = load_shared_stock_csv(stock_csv_path)
+    # --- STOCK: prefer provided DF, otherwise fetch combined stock DF (ralawise etc.) ---
+    if stock_csv_df is None:
+        from stock_sources import build_combined_stock_df
+        stock_csv_df = build_combined_stock_df(prefer="ralawise", progress=progress)
+
+    if "sku" not in stock_csv_df.columns or "free" not in stock_csv_df.columns:
+        raise RuntimeError(f"stock_csv_df missing required columns. Found: {list(stock_csv_df.columns)}")
+
+    tmp = stock_csv_df[["sku", "free"]].copy()
+    tmp["sku"] = tmp["sku"].astype(str).str.strip()
+    tmp["free"] = pd.to_numeric(tmp["free"], errors="coerce").fillna(0).astype(int)
+
+    dup_count = int(tmp["sku"].duplicated(keep=False).sum())
+    if dup_count:
+        log(f"⚠️ Stock feed contains duplicate SKUs: {dup_count} rows (keeping last per SKU).", progress)
+
+    stock_map = tmp.groupby("sku")["free"].last().to_dict()
     log(f"📥 Loaded stock rows: {len(stock_map)}", progress)
 
-    inv_map_df = pd.read_csv(map_csv, dtype=str)
+    inv_map_df = _safe_read_csv(map_csv, dtype=str)
+    log(f"🗺️ Mapping rows loaded: {len(inv_map_df)} from {map_csv}", progress)
+
     if inv_map_df.empty:
         raise RuntimeError("Mapping CSV is empty. Build mapping first.")
 
+    # product type filtering (optional)
     if product_types:
         allowed = get_product_ids_for_types(graphql_endpoint, headers, product_types)
         before = len(inv_map_df)
         inv_map_df = inv_map_df[inv_map_df["product_id"].isin(allowed)].copy()
         log(f"🔎 Product types {product_types} → {len(inv_map_df)}/{before} variants", progress)
 
-    if sku_prefix:
-        before = len(inv_map_df)
-        inv_map_df = inv_map_df[inv_map_df["sku"].astype(str).str.startswith(sku_prefix)]
-        log(f"🔎 SKU prefix '{sku_prefix}' → {len(inv_map_df)}/{before} variants", progress)
+    # SKU prefix filtering (optional)
+    if sku_prefixes:
+        if isinstance(sku_prefixes, str):
+            sku_prefixes = [sku_prefixes]
+        prefixes = tuple(p.upper() for p in sku_prefixes if p)
 
-    before = len(inv_map_df)
+        before = len(inv_map_df)
+        inv_map_df["__SKU_U"] = inv_map_df["sku"].astype(str).str.upper()
+        inv_map_df = inv_map_df[inv_map_df["__SKU_U"].str.startswith(prefixes)].drop(columns="__SKU_U")
+        log(f"🔎 SKU prefixes {sku_prefixes} → {len(inv_map_df)}/{before} variants", progress)
+
+    # -----------------------------
+    # Stock matching + unmatched SKU report
+    # -----------------------------
+    before_all = len(inv_map_df)
+
+    # Normalize stock_map keys ONCE (critical)
+    stock_map = {str(k).strip().upper(): int(v) for k, v in stock_map.items()}
 
     def to_lookup_sku(s: str) -> Optional[str]:
-        if s in stock_map:
-            return s
-        t = translate_sku(s)
-        return t if t and t in stock_map else None
+        """
+        Returns normalized SKU to lookup in stock_map, or None if no match.
+        - Normalizes to UPPER/strip
+        - Optionally translates BY102-... -> BY102<colour><size>
+        """
+        s0 = str(s).strip().upper()
 
+        # If store skips translation, only direct match allowed
+        if profile.get("SKIP_TRANSLATION", False):
+            return s0 if s0 in stock_map else None
+
+        # Direct match first
+        if s0 in stock_map:
+            return s0
+
+        # Try translation
+        t = translate_sku(s0)
+        t0 = t.strip().upper() if t else None
+        return t0 if t0 and t0 in stock_map else None
+
+    # Compute lookup SKU for each mapping row
     inv_map_df["lookup_sku"] = inv_map_df["sku"].astype(str).apply(to_lookup_sku)
-    translated_count = int((inv_map_df["lookup_sku"] != inv_map_df["sku"]).sum())
+
+    # Build unmatched report BEFORE filtering
+    unmatched_df = build_unmatched_sku_report(inv_map_df, stock_map)
+
+    # translated count: lookup exists AND differs from normalized original
+    translated_mask = (
+        inv_map_df["lookup_sku"].notna()
+        & (inv_map_df["lookup_sku"].astype(str).str.upper()
+           != inv_map_df["sku"].astype(str).str.strip().str.upper())
+    )
+    translated_count = int(translated_mask.sum())
+
+    # Keep only matched rows for updates
     inv_map_df = inv_map_df[inv_map_df["lookup_sku"].notna()].copy()
-    log(f"🔗 Stock matches: {len(inv_map_df)}/{before} (translated: {translated_count})", progress)
+    log(f"🔗 Stock matches: {len(inv_map_df)}/{before_all} (translated: {translated_count})", progress)
+
+    # --- In-memory unmatched report bytes (service-friendly) ---
+    unmatched_report_name = ""
+    unmatched_report_csv_bytes = b""
+    if not unmatched_df.empty:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unmatched_report_name = f"unmatched_skus_{str(store_key).lower()}_{ts}.csv"
+        unmatched_report_csv_bytes = unmatched_df.to_csv(index=False).encode("utf-8")
+        log(f"⚠️ Unmatched SKUs: {len(unmatched_df)} rows.", progress)
+    else:
+        log("✅ No unmatched SKUs (everything can be matched to stock feed).", progress)
 
     if inv_map_df.empty:
         elapsed = round(time.time() - start_ts, 2)
         return pd.DataFrame(), {
             "updated": 0, "dry": 0, "errors": 0, "translated": translated_count,
-            "skipped": before, "report_filename": "", "elapsed_secs": elapsed,
+            "skipped": before_all,
+            "report_name": "", "report_csv_bytes": b"",
+            "unmatched_report_name": unmatched_report_name,
+            "unmatched_report_csv_bytes": unmatched_report_csv_bytes,
+            "unmatched_count": int(len(unmatched_df)),
+            "failed_report_name": "",
+            "failed_report_csv_bytes": b"",
+            "failed_count": 0,
+            "elapsed_secs": elapsed,
             "message": "Nothing to update after filters."
         }
+
 
     location_gid = get_location_gid(graphql_endpoint, headers, location_name)
     log(f"📦 Using location: {location_gid}", progress)
 
     updates = []
     for _, row in inv_map_df.iterrows():
-        key = row["lookup_sku"]
+        key = row["lookup_sku"]  # normalized key or translated key
         updates.append({
             "inventoryItemId": row["inventory_item_id"],
             "quantity": int(stock_map[key]),
@@ -816,16 +1036,26 @@ def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional
     log(f"🚚 Updating {total} variants in batches of {batch_size} (dry_run={dry_run})…", progress)
 
     report_rows = []
-    translated_lookup = set(inv_map_df[inv_map_df["lookup_sku"] != inv_map_df["sku"]]["sku"].tolist())
+    translated_lookup = set(
+        inv_map_df[
+            inv_map_df["lookup_sku"].astype(str).str.upper()
+            != inv_map_df["sku"].astype(str).str.strip().str.upper()
+        ]["sku"].tolist()
+    )
 
     processed = 0
     for i in range(0, total, batch_size):
-        batch = updates[i:i+batch_size]
-        ok, user_errors = set_on_hand_quantities(graphql_endpoint, headers, batch, location_gid, dry_run, progress=progress)
+        batch = updates[i:i + batch_size]
+        ok, user_errors = set_on_hand_quantities(
+            graphql_endpoint, headers, batch, location_gid, dry_run, progress=progress
+        )
+
         if ok:
             for b in batch:
                 report_rows.append({
-                    "sku": b["sku"], "resolved_sku": b["resolved_sku"], "new_qty": b["quantity"],
+                    "sku": b["sku"],
+                    "resolved_sku": b["resolved_sku"],
+                    "new_qty": b["quantity"],
                     "status": "dry-run" if dry_run else "updated",
                     "translated": "yes" if b["sku"] in translated_lookup else "no",
                     "error": ""
@@ -834,30 +1064,52 @@ def run_update(*, store: str, sku_prefix: Optional[str], product_types: Optional
             msg = "; ".join([e.get("message", "") for e in (user_errors or [])])
             for b in batch:
                 report_rows.append({
-                    "sku": b["sku"], "resolved_sku": b["resolved_sku"], "new_qty": b["quantity"],
+                    "sku": b["sku"],
+                    "resolved_sku": b["resolved_sku"],
+                    "new_qty": b["quantity"],
                     "status": "error",
                     "translated": "yes" if b["sku"] in translated_lookup else "no",
                     "error": msg
                 })
+
         processed += len(batch)
         log(f"   ✓ {processed}/{total}", progress)
         time.sleep(SLEEP_BETWEEN_CALLS)
 
     report_df = pd.DataFrame(report_rows)
+
+    failed_df = report_df[report_df["status"] == "error"].copy()
+    failed_report_name = ""
+    failed_report_csv_bytes = b""
+    if not failed_df.empty:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_report_name = f"failed_updates_{str(store_key).lower()}_{ts}.csv"
+        failed_report_csv_bytes = failed_df.to_csv(index=False).encode("utf-8")
+
+
     updated = int((report_df["status"] == "updated").sum())
     dry = int((report_df["status"] == "dry-run").sum())
     errs = int((report_df["status"] == "error").sum())
     elapsed = round(time.time() - start_ts, 2)
+
+    # --- In-memory report (NO local storage) ---
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"update_report_{store}_{ts}.csv"
-    report_df.to_csv(report_filename, index=False)
+    report_name = f"update_report_{str(store_key).lower()}_{ts}.csv"
+    report_csv_bytes = report_df.to_csv(index=False).encode("utf-8")
 
     return report_df, {
         "updated": updated,
         "dry": dry,
         "errors": errs,
         "translated": translated_count,
-        "skipped": before - len(inv_map_df),
-        "report_filename": report_filename,
+        "skipped": before_all - len(inv_map_df),
+        "report_name": report_name,
+        "report_csv_bytes": report_csv_bytes,
+        "unmatched_report_name": unmatched_report_name,
+        "unmatched_report_csv_bytes": unmatched_report_csv_bytes,
+        "unmatched_count": int(len(unmatched_df)),
         "elapsed_secs": elapsed,
+        "failed_report_name": failed_report_name,
+        "failed_report_csv_bytes": failed_report_csv_bytes,
+        "failed_count": int(len(failed_df)),
     }

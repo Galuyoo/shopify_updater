@@ -32,4 +32,9 @@ SHEET_SOURCES = {
         "1TxokufF-Ct9s8P6zjc6quIJrxbmJudYfdJ7R6ij8Z6o",
         "1XiXSIPAORIzK_PT38Kaf3_JySCqvLrPFy4ag1EssGB8",
     ],
+    "fullyblessed": [
+        "1TUQ3nLq72OljDzTWmQsPrqkG2UJwhp0AJ7bzo7trVbc"
+    ]
 }
+
+

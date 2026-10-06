@@ -4,3 +4,11 @@ update_report_*.csv
 .history
 *.json
 .streamlit/
+*.csv
+.ralawise.py  # (if you don’t want to expose the API key)
+.streamlit/secrets.toml
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+logs/
+*.log
