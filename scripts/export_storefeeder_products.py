@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import pandas as pd
+import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -77,7 +79,7 @@ def fetch_products(client: StoreFeederApiClient, *, page_size: int, limit: int |
     products: list[dict[str, Any]] = []
     page = 1
     while True:
-        wrapper = client.get_products_page(page=page, page_size=page_size)
+        wrapper = _get_products_page_with_retry(client, page=page, page_size=page_size)
         status_code = int(wrapper.get("_status_code", 0))
         if status_code >= 400:
             raise RuntimeError(f"StoreFeeder product list request failed {status_code}: {wrapper.get('response')}")
@@ -95,6 +97,57 @@ def fetch_products(client: StoreFeederApiClient, *, page_size: int, limit: int |
             break
         page += 1
     return products
+
+
+
+_TRANSIENT_PRODUCT_PAGE_STATUSES = {408, 409, 429, 500, 502, 503, 504}
+
+
+def _get_products_page_with_retry(
+    client: StoreFeederApiClient,
+    *,
+    page: int,
+    page_size: int,
+    attempts: int = 6,
+) -> dict[str, Any]:
+    wrapper: dict[str, Any] = {}
+    last_transport_error: requests.RequestException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            wrapper = client.get_products_page(page=page, page_size=page_size)
+            last_transport_error = None
+        except requests.RequestException as exc:
+            last_transport_error = exc
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"StoreFeeder product page {page} failed after {attempts} transport attempts"
+                ) from exc
+            delay = min(30, 2 ** attempt)
+            print(
+                f"StoreFeeder product page {page} transport error "
+                f"{type(exc).__name__}; retrying {attempt}/{attempts} after {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+
+        status = int(wrapper.get("_status_code", 0) or 0)
+        if status not in _TRANSIENT_PRODUCT_PAGE_STATUSES:
+            return wrapper
+        if attempt < attempts:
+            delay = min(30, 2 ** attempt)
+            print(
+                f"StoreFeeder product page {page} returned HTTP {status}; "
+                f"retrying {attempt}/{attempts} after {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    if last_transport_error is not None:
+        raise RuntimeError(
+            f"StoreFeeder product page {page} failed after {attempts} transport attempts"
+        ) from last_transport_error
+    return wrapper
 
 
 def build_snapshot_rows(client: StoreFeederApiClient, products: list[dict[str, Any]]) -> list[dict[str, str]]:
