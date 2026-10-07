@@ -16,6 +16,9 @@ MAX_STOREFEEDER_BATCH_SIZE = 50
 STOREFEEDER_STOCK_LOCATION_INVENTORY_PATH = "/products/stocklocationinventory"
 STOREFEEDER_SUPPLIER_INVENTORY_COST_PATH = "/products/productsuppliers/inventory-cost"
 STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE = "/products/{product_id}/productsuppliers"
+STOREFEEDER_STOCK_LOCATION_TRANSFERS_PATH = "/stocklocations/create-transfers"
+STOREFEEDER_LISTINGS_PATH = "/listings"
+STOREFEEDER_LISTINGS_BULK_PATH = "/listings/bulk"
 
 
 @dataclass(frozen=True)
@@ -507,7 +510,13 @@ class StoreFeederApiClient:
             response_json=response_json,
         )
 
-    def get_products_page(self, *, page: int = 1, page_size: int = 100) -> dict[str, Any]:
+    def get_products_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        include_stock_locations: bool = False,
+    ) -> dict[str, Any]:
         if page < 1:
             raise ValueError("page must be at least 1")
         if page_size < 1:
@@ -516,13 +525,137 @@ class StoreFeederApiClient:
         url = self.config.base_url.rstrip("/") + "/products"
         response = self.session.get(
             url,
-            params={"page": page, "pageSize": page_size},
+            params={
+                "Page": page,
+                "PageSize": page_size,
+                "IncludeStockLocations": str(include_stock_locations).lower(),
+                "ExcludeTaxRateCountries": "true",
+            },
             timeout=self.config.timeout_seconds,
         )
         return {
             "_status_code": response.status_code,
             "response": _response_json(response),
         }
+
+    def get_stock_locations_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        include_system: bool = True,
+    ) -> dict[str, Any]:
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if page_size < 1 or page_size > 100:
+            raise ValueError("page_size must be between 1 and 100")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + "/stocklocations"
+        response = self.session.get(
+            url,
+            params={
+                "Page": page,
+                "PageSize": page_size,
+                "IncludeSystem": str(include_system).lower(),
+            },
+            timeout=self.config.timeout_seconds,
+        )
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def get_stock_location(self, stock_location_id: str) -> dict[str, Any]:
+        stock_location_id = str(stock_location_id).strip()
+        if not stock_location_id.isdigit():
+            raise ValueError("numeric StockLocationID is required")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + f"/stocklocations/{stock_location_id}"
+        response = self.session.get(url, timeout=self.config.timeout_seconds)
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def get_orders_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        is_archived: bool = False,
+    ) -> dict[str, Any]:
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if page_size < 1 or page_size > 100:
+            raise ValueError("page_size must be between 1 and 100")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + "/orders"
+        response = self.session.get(
+            url,
+            params={
+                "Page": page,
+                "PageSize": page_size,
+                "IsArchived": str(is_archived).lower(),
+            },
+            timeout=self.config.timeout_seconds,
+        )
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def get_listings_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        channel_id: int | None = None,
+        listing_status: str | None = None,
+    ) -> dict[str, Any]:
+        if page < 1:
+            raise ValueError("page must be at least 1")
+        if page_size < 1 or page_size > 100:
+            raise ValueError("page_size must be between 1 and 100")
+        params: dict[str, Any] = {"Page": page, "PageSize": page_size}
+        if channel_id is not None:
+            if int(channel_id) < 1:
+                raise ValueError("channel_id must be a positive integer")
+            params["ChannelID"] = int(channel_id)
+        if listing_status:
+            params["ListingStatus"] = str(listing_status).strip()
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + STOREFEEDER_LISTINGS_PATH
+        response = self.session.get(url, params=params, timeout=self.config.timeout_seconds)
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def get_listing(self, listing_id: str | int) -> dict[str, Any]:
+        listing_id_text = str(listing_id).strip()
+        if not listing_id_text.isdigit() or int(listing_id_text) < 1:
+            raise ValueError("numeric ListingID is required")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + f"{STOREFEEDER_LISTINGS_PATH}/{listing_id_text}"
+        response = self.session.get(url, timeout=self.config.timeout_seconds)
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def patch_listing(self, listing_id: str | int, patch: dict[str, Any]) -> dict[str, Any]:
+        listing_id_text = str(listing_id).strip()
+        if not listing_id_text.isdigit() or int(listing_id_text) < 1:
+            raise ValueError("numeric ListingID is required")
+        if not patch:
+            raise ValueError("listing patch cannot be empty")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + f"{STOREFEEDER_LISTINGS_PATH}/{listing_id_text}"
+        response = self.session.patch(url, json=patch, timeout=self.config.timeout_seconds)
+        return {"_status_code": response.status_code, "response": _response_json(response)}
+
+    def patch_listings_bulk(self, commands: list[dict[str, Any]]) -> dict[str, Any]:
+        if not commands:
+            raise ValueError("at least one listing patch command is required")
+        if len(commands) > MAX_STOREFEEDER_BATCH_SIZE:
+            raise ValueError("StoreFeeder bulk listing patch exceeds 50 listings")
+        for command in commands:
+            listing_id_text = str(command.get("ListingID", "")).strip()
+            if not listing_id_text.isdigit() or int(listing_id_text) < 1:
+                raise ValueError("every bulk listing patch requires a numeric ListingID")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + STOREFEEDER_LISTINGS_BULK_PATH
+        response = self.session.patch(
+            url,
+            json={"Commands": commands},
+            timeout=self.config.timeout_seconds,
+        )
+        return {"_status_code": response.status_code, "response": _response_json(response)}
 
     def get_product(self, product_id: str) -> dict[str, Any]:
         product_id = str(product_id).strip()
@@ -544,6 +677,35 @@ class StoreFeederApiClient:
         path = STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE.format(product_id=product_id)
         url = self.config.base_url.rstrip("/") + path
         response = self.session.get(url, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
+    def delete_product_supplier(self, product_id: str, supplier_id: str) -> dict[str, Any]:
+        product_id = str(product_id).strip()
+        supplier_id = str(supplier_id).strip()
+        if not product_id:
+            raise ValueError("ProductID is required for StoreFeeder supplier deletion")
+        if not supplier_id:
+            raise ValueError("SupplierID is required for StoreFeeder supplier deletion")
+        self.rate_limiter.wait()
+        path = STOREFEEDER_PRODUCT_SUPPLIERS_PATH_TEMPLATE.format(product_id=product_id)
+        url = self.config.base_url.rstrip("/") + f"{path}/{supplier_id}"
+        response = self.session.delete(url, timeout=self.config.timeout_seconds)
+        return {
+            "_status_code": response.status_code,
+            "response": _response_json(response),
+        }
+
+    def create_stock_location_transfers(self, transfers: list[dict[str, Any]]) -> dict[str, Any]:
+        if not transfers:
+            raise ValueError("At least one StoreFeeder stock location transfer is required")
+        if len(transfers) > MAX_STOREFEEDER_BATCH_SIZE:
+            raise ValueError("StoreFeeder API batch exceeds 50 transfers")
+        self.rate_limiter.wait()
+        url = self.config.base_url.rstrip("/") + STOREFEEDER_STOCK_LOCATION_TRANSFERS_PATH
+        response = self.session.post(url, json=transfers, timeout=self.config.timeout_seconds)
         return {
             "_status_code": response.status_code,
             "response": _response_json(response),
@@ -614,24 +776,50 @@ def fetch_storefeeder_access_token(config: StoreFeederApiConfig) -> str:
         raise RuntimeError("Missing StoreFeeder API credential env vars: " + ", ".join(missing))
 
     url = config.base_url.rstrip("/") + "/Token"
-    response = requests.post(
-        url,
-        data={
-            "grant_type": "password",
-            "username": username,
-            "password": password,
-            "client_id": api_key,
-        },
-        headers={"Accept": "application/json"},
-        timeout=config.timeout_seconds,
-    )
-    payload = _response_json(response)
-    if response.status_code >= 400:
-        raise RuntimeError(f"StoreFeeder token request failed {response.status_code}: {_safe_error_text(payload)}")
-    access_token = str(payload.get("access_token", "")).strip()
-    if not access_token:
-        raise RuntimeError("StoreFeeder token response did not include access_token")
-    return access_token
+    transient_statuses = {408, 409, 429, 500, 502, 503, 504}
+    attempts = 6
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                data={
+                    "grant_type": "password",
+                    "username": username,
+                    "password": password,
+                    "client_id": api_key,
+                },
+                headers={"Accept": "application/json"},
+                timeout=config.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"StoreFeeder token request failed after {attempts} transport attempts"
+                ) from exc
+            time.sleep(min(30, 2 ** attempt))
+            continue
+
+        payload = _response_json(response)
+        if response.status_code < 400:
+            access_token = str(payload.get("access_token", "")).strip()
+            if not access_token:
+                raise RuntimeError("StoreFeeder token response did not include access_token")
+            return access_token
+
+        if response.status_code not in transient_statuses or attempt >= attempts:
+            raise RuntimeError(
+                f"StoreFeeder token request failed {response.status_code}: {_safe_error_text(payload)}"
+            )
+
+        last_error = RuntimeError(
+            f"StoreFeeder token request failed {response.status_code}: {_safe_error_text(payload)}"
+        )
+        time.sleep(min(30, 2 ** attempt))
+
+    raise RuntimeError("StoreFeeder token request failed after retries") from last_error
 
 
 def _response_json(response: requests.Response) -> dict[str, Any]:

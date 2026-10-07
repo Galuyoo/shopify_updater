@@ -627,14 +627,6 @@ def converge_inventory_differences(
                 _, available = _inventory_values(product)
                 locations = _stock_locations(product)
                 signature = deduction_signature(locations, WAREHOUSE_ID)
-                if signature != str(row["DeductionSignature"]):
-                    raise RuntimeError("ledger_deductions_changed_during_mirror")
-                plan = build_physical_stock_mirror_plan(
-                    target_warehouse_physical=expected,
-                    current_available=int(_number(available)),
-                    locations=locations,
-                    warehouse_stock_location_id=WAREHOUSE_ID,
-                )
                 warehouse = [
                     location for location in locations
                     if _location_id(location) == WAREHOUSE_ID
@@ -643,6 +635,12 @@ def converge_inventory_differences(
                     int(_number(warehouse[0].get("PhysicalStock")))
                     if len(warehouse) == 1 else None
                 )
+
+                # Allocation/pending-out ledgers can legitimately change while the
+                # multi-hour reconciliation is running. If physical warehouse stock
+                # has already converged to the supplier target, that is the authority
+                # this job controls and the row is complete; do not fail only because
+                # an order changed the deduction ledger after the preflight snapshot.
                 if warehouse_physical == expected:
                     success_rows.append({
                         "ProductID": product_id,
@@ -654,6 +652,16 @@ def converge_inventory_differences(
                         "Result": "PASS",
                     })
                     break
+
+                if signature != str(row["DeductionSignature"]):
+                    raise RuntimeError("ledger_deductions_changed_during_mirror")
+
+                plan = build_physical_stock_mirror_plan(
+                    target_warehouse_physical=expected,
+                    current_available=int(_number(available)),
+                    locations=locations,
+                    warehouse_stock_location_id=WAREHOUSE_ID,
+                )
                 if extra_writes >= 2:
                     raise RuntimeError(
                         f"bounded_convergence_exhausted: physical={warehouse_physical}; target={expected}"

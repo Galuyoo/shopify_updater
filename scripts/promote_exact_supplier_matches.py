@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.export_storefeeder_products import build_snapshot_rows, fetch_products
 from src.stock_mapping import build_supplier_stock_lookup
-from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig
+from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig, fetch_storefeeder_access_token
 from src.storefeeder_stock_export import read_csv
 
 
@@ -487,8 +487,18 @@ def _create_and_verify_product_supplier(
 
     try:
         response = client.create_product_supplier(product_id, item)
+        if int(response.get("_status_code", 0)) == 401:
+            token = fetch_storefeeder_access_token(client.config)
+            client.session.headers.update({"Authorization": f"Bearer {token}"})
+            response = client.create_product_supplier(product_id, item)
+
         status_code = int(response.get("_status_code", 0))
         readback = client.get_product_suppliers(product_id)
+        if int(readback.get("_status_code", 0)) == 401:
+            token = fetch_storefeeder_access_token(client.config)
+            client.session.headers.update({"Authorization": f"Bearer {token}"})
+            readback = client.get_product_suppliers(product_id)
+
         verified = _readback_contains_supplier(readback, candidate)
         ok = status_code < 400 and verified
         row = {
