@@ -26,7 +26,7 @@ from scripts.promote_exact_supplier_matches import (
     _target_row,
 )
 from src.stock_mapping import build_supplier_stock_lookup
-from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig
+from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig, fetch_storefeeder_access_token
 from src.storefeeder_stock_export import read_csv
 
 SUMMARY_COLUMNS = ["metric", "value"]
@@ -1184,7 +1184,12 @@ def _first_value(payload: dict[str, Any], names: list[str]) -> str:
 
 def _product_has_supplier(client: StoreFeederApiClient, product_id: str, candidate: dict[str, Any]) -> bool:
     try:
-        return _readback_contains_supplier(client.get_product_suppliers(product_id), candidate)
+        readback = client.get_product_suppliers(product_id)
+        if int(readback.get("_status_code", 0) or 0) == 401:
+            token = fetch_storefeeder_access_token(client.config)
+            client.session.headers.update({"Authorization": f"Bearer {token}"})
+            readback = client.get_product_suppliers(product_id)
+        return _readback_contains_supplier(readback, candidate)
     except Exception:
         return False
 
