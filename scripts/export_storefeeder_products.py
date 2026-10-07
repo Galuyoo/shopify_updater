@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig
+from src.storefeeder_api import StoreFeederApiClient, StoreFeederApiConfig, fetch_storefeeder_access_token
 
 
 OUTPUT_COLUMNS = [
@@ -132,6 +132,24 @@ def _get_products_page_with_retry(
             continue
 
         status = int(wrapper.get("_status_code", 0) or 0)
+
+        if status == 401:
+            try:
+                token = fetch_storefeeder_access_token(client.config)
+                client.session.headers.update({"Authorization": f"Bearer {token}"})
+            except Exception:
+                if attempt >= attempts:
+                    raise
+            if attempt < attempts:
+                delay = min(30, 2 ** attempt)
+                print(
+                    f"StoreFeeder product page {page} returned HTTP 401; "
+                    f"refreshed auth and retrying {attempt}/{attempts} after {delay}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+
         if status not in _TRANSIENT_PRODUCT_PAGE_STATUSES:
             return wrapper
         if attempt < attempts:
